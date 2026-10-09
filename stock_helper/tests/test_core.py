@@ -171,3 +171,12 @@ def test_flows_fallback_chain():
             mock.patch("data.fetch_flows_naver_mobile",
                        return_value=pd.DataFrame({"inst": [1.0]})) as m:
         assert len(data.fetch_flows("005930")) == 1 and m.called
+
+
+def test_clean_ohlcv_zero_open():
+    df = pd.DataFrame({"open": [0.0, 100], "high": [0.0, 105], "low": [0.0, 95],
+                       "close": [101.0, 102], "volume": [0.0, 10]},
+                      index=pd.bdate_range("2026-01-01", periods=2))
+    c = data.clean_ohlcv(df)
+    assert (c.iloc[0][["open", "high", "low"]] == 101).all()
+    assert c.iloc[1].open == 100

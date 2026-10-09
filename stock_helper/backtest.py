@@ -89,6 +89,9 @@ def simulate(d: pd.DataFrame, p: Params, code: str = "") -> list[dict]:
             continue
         j = i + 1                      # 진입일
         entry, a = o[j], atr[i]
+        if not entry > 0:              # 데이터 이상(시가 0) -> 건너뜀
+            i += 1
+            continue
         stop, t1, t2 = entry - p.sl_atr * a, entry + p.tp_atr * a, entry + p.tp2_atr * a
         be = entry * (1 + p.cost)      # 본전 스탑
         half = None                    # 1차 익절한 절반의 수익률

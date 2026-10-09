@@ -26,6 +26,17 @@ class DataError(RuntimeError):
 
 
 # ---------------------------------------------------------------- 시세(일봉)
+def clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """시가/고가/저가가 0 또는 빈 값인 날(거래정지 등)을 종가로 채우고 고저가를 정합화."""
+    df = df[df["close"] > 0].copy()
+    for col in ("open", "high", "low"):
+        bad = ~(df[col] > 0)
+        df.loc[bad, col] = df.loc[bad, "close"]
+    df["high"] = df[["open", "high", "close"]].max(axis=1)
+    df["low"] = df[["open", "low", "close"]].min(axis=1)
+    return df
+
+
 def fetch_ohlcv(code: str, count: int = 300) -> tuple[pd.DataFrame, str]:
     """일봉 OHLCV와 종목명을 반환. index=날짜, columns=open/high/low/close/volume"""
     url = ("https://fchart.stock.naver.com/sise.nhn"
@@ -45,8 +56,7 @@ def fetch_ohlcv(code: str, count: int = 300) -> tuple[pd.DataFrame, str]:
             recs.append((pd.Timestamp(d), float(o), float(h), float(l), float(c), float(v)))
         df = pd.DataFrame(recs, columns=["date", "open", "high", "low", "close", "volume"])
         df = df.set_index("date").sort_index()
-        df = df[df["close"] > 0]
-        return df, name
+        return clean_ohlcv(df), name
     except (requests.RequestException, DataError) as e:
         naver_err = e
 
@@ -61,7 +71,7 @@ def fetch_ohlcv(code: str, count: int = 300) -> tuple[pd.DataFrame, str]:
         df = df[["open", "high", "low", "close", "volume"]].astype(float)
         df.index.name = "date"
         name = stock.get_market_ticker_name(code)
-        return df.tail(count), name
+        return clean_ohlcv(df.tail(count)), name
     except Exception as e:  # noqa: BLE001
         raise DataError(f"시세 조회 실패 ({code}): naver={naver_err!r}, pykrx={e!r}") from e
 
@@ -224,7 +234,7 @@ def load(code: str, days: int = 250, cache_hours: float = 0) -> tuple[pd.DataFra
             time.time() - os.path.getmtime(path) < cache_hours * 3600:
         df = pd.read_csv(path, index_col="date", parse_dates=["date"])
         name = str(df.pop("name").iloc[-1])
-        return df, name
+        return clean_ohlcv(df), name
     df, name = _load(code, days)
     if cache_hours > 0:
         os.makedirs(CACHE_DIR, exist_ok=True)
@@ -238,7 +248,7 @@ def refresh_price(df: pd.DataFrame, code: str) -> pd.DataFrame:
     out = df.copy()
     for col in recent.columns:
         out.loc[recent.index, col] = recent[col]  # 새 날짜는 행이 추가됨
-    return out.sort_index()
+    return clean_ohlcv(out.sort_index())
 
 
 def _load(code: str, days: int) -> tuple[pd.DataFrame, str]:

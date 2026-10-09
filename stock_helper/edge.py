@@ -22,7 +22,10 @@ def forward_table(datasets: dict[str, pd.DataFrame], horizon: int = 5) -> pd.Dat
         n = len(d)
         fwd = np.full(n, np.nan)
         if n > horizon + 1:
-            fwd[: n - horizon - 1] = (c[horizon + 1:] / o[1: n - horizon] - 1) * 100
+            entry = o[1: n - horizon]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                fwd[: n - horizon - 1] = np.where(entry > 0, (c[horizon + 1:] / entry - 1) * 100,
+                                                  np.nan)
         t = pd.DataFrame({"code": code, "date": d.index, "score": d["score"].to_numpy(),
                           "fwd": fwd, "mkt_ok": d.get("mkt_ok", True)})
         for k in PARTS:
