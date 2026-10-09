@@ -50,8 +50,31 @@ def test_signal_and_backtest():
     s = score_at(d)
     assert -100 <= s.score <= 100 and s.has_flows and s.reasons
     assert s.stop < s.close < s.target1 < s.target2
-    res = backtest.run(d)
-    assert res.win_rate >= 0
+    d = backtest.prepare(data.synthetic(250, seed=3))
+    trades = backtest.simulate(d, backtest.Params(), "X")
+    assert trades and all(t["entry_date"] < t["exit_date"] or t["held"] == 1 for t in trades)
+    st = backtest.summarize(trades)
+    assert st["n"] == len(trades) and 0 <= st["win"] <= 100
+
+
+def test_simulate_stop_and_target():
+    idx = pd.bdate_range("2026-01-01", periods=5)
+    d = pd.DataFrame({"open": [100, 100, 100, 100, 100], "high": [101, 101, 111, 101, 101],
+                      "low": [99, 99, 99, 99, 99], "close": [100] * 5, "atr": [5.0] * 5,
+                      "score": [50, 0, 0, 0, 0]}, index=idx)
+    t = backtest.simulate(d, backtest.Params(tp_atr=2, sl_atr=2, cost=0), "X")
+    assert t[0]["reason"] == "익절" and t[0]["exit"] == 110
+    d.loc[idx[1], "low"] = 85     # 진입 당일 손절가(90) 이탈
+    t = backtest.simulate(d, backtest.Params(tp_atr=2, sl_atr=2, cost=0), "X")
+    assert t[0]["reason"] == "손절" and t[0]["exit"] == 90
+
+
+def test_optimize_picks_profitable():
+    ds = {f"D{i}": backtest.prepare(data.synthetic(200, seed=i)) for i in range(3)}
+    grid = dict(buy_th=[25], tp_atr=[1.0, 3.0], sl_atr=[2.0], max_hold=[5])
+    best, rows, _ = backtest.optimize(ds, min_train=5, grid=grid)
+    assert len(rows) == 2
+    assert best is None or best["train"]["avg"] > 0
 
 
 def test_without_flows():

@@ -1,3 +1,6 @@
 chart_*.png
 __pycache__/
 .pytest_cache/
+cache/
+paper_trades.csv
+best_params.json

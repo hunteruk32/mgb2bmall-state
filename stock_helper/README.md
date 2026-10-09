@@ -12,12 +12,25 @@ python main.py analyze 005930            # 종목 분석 + 매수/매도 의견
 python main.py analyze 005930 --chart    # chart_005930.png 저장 (가격/수급/RSI/점수)
 python main.py scan watchlist.txt        # 관심종목 점수 랭킹
 python main.py scan 005930,000660        # 쉼표로 바로 입력도 가능
-python main.py backtest 005930           # 이 전략이 과거에 통했는지 검증
-python main.py backtest 005930 --buy 40 --hold 5   # 기준 바꿔서 검증
+python main.py optimize                  # universe.txt 30종목 × 2년으로 승률 최적 설정 찾기
+python main.py backtest 005930,000660 --show       # 저장된 설정으로 백테스트 (거래내역 포함)
+python main.py backtest universe.txt --tp 1 --sl 2 # 설정 바꿔서 검증
+python main.py monitor                   # 장중 5분마다 watchlist.txt 감시 + 모의매매 기록
+python main.py monitor --once            # 1회만 점검 (장외에도 가능)
+python main.py paper                     # 모의매매 승률 (100회 목표)
 python main.py analyze DEMO              # 인터넷 없이 가상 데이터로 시험
 ```
 데이터: 네이버 금융(로그인 불필요) → 실패 시 pykrx 자동 대체.
 장 마감(15:30) 후, 수급 확정치가 올라오는 저녁에 돌리는 것을 권장합니다.
+
+## 매수·매도 조건
+전체 조건표는 [STRATEGY.md](STRATEGY.md)에 코드와 똑같이 정리되어 있습니다.
+
+## 추천 사용 순서
+1. `optimize`: 과거 데이터로 설정 선택 (첫 실행은 데이터 수집에 몇 분 걸림, 이후 12시간 캐시)
+2. **검증 구간** 승률·평균수익 확인
+3. 장중 `monitor`로 실시간 모의매매 → `paper`로 100회 누적 성적 확인
+4. 모의매매에서도 목표를 달성하면 그때 소액 실전 매매
 
 ## 점수 구성
 | 영역 | 비중 | 보는 것 |
@@ -51,7 +64,9 @@ python main.py analyze DEMO              # 인터넷 없이 가상 데이터로 
 data.py        네이버/pykrx 데이터 수집, DEMO 가상데이터
 indicators.py  MA, RSI, MACD, 볼린저, ATR, 스토캐스틱, MFI, OBV, 수급 합계/연속일수
 signals.py     점수 산출 · 의견 · 근거 · 손절/목표가
-backtest.py    점수 전략 백테스트 (왕복비용 0.25% 반영)
+backtest.py    백테스트 · 파라미터 최적화 (학습/검증 분리, 왕복비용 0.25%)
+realtime.py    장중 감시 · 모의매매 기록(paper_trades.csv)
+STRATEGY.md    매수/매도 조건 전체
 main.py        CLI
 tests/         pytest
 ```

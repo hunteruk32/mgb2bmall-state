@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 
@@ -134,11 +135,38 @@ def fetch_flows(code: str, days: int = 160) -> pd.DataFrame:
             raise DataError(f"수급 조회 실패 ({code}): naver={e1!r}, pykrx={e2!r}") from e2
 
 
-def load(code: str, days: int = 250) -> tuple[pd.DataFrame, str]:
-    """시세 + 수급을 합친 DataFrame. 수급 조회 실패 시 시세만 반환(수급 컬럼 NaN)."""
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+
+
+def load(code: str, days: int = 250, cache_hours: float = 0) -> tuple[pd.DataFrame, str]:
+    """시세 + 수급을 합친 DataFrame. 수급 조회 실패 시 시세만 반환(수급 컬럼 NaN).
+    cache_hours > 0 이면 cache/ 폴더의 CSV를 해당 시간 동안 재사용."""
+    path = os.path.join(CACHE_DIR, f"{code}_{days}.csv")
+    if cache_hours > 0 and os.path.exists(path) and \
+            time.time() - os.path.getmtime(path) < cache_hours * 3600:
+        df = pd.read_csv(path, index_col="date", parse_dates=["date"])
+        name = str(df.pop("name").iloc[-1])
+        return df, name
+    df, name = _load(code, days)
+    if cache_hours > 0:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        df.assign(name=name).to_csv(path)
+    return df, name
+
+
+def refresh_price(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    """캐시된 데이터에 최근 시세(장중이면 오늘 진행 중인 봉 포함)를 덮어씀."""
+    recent, _ = fetch_ohlcv(code, count=5)
+    out = df.copy()
+    for col in recent.columns:
+        out.loc[recent.index, col] = recent[col]  # 새 날짜는 행이 추가됨
+    return out.sort_index()
+
+
+def _load(code: str, days: int) -> tuple[pd.DataFrame, str]:
     price, name = fetch_ohlcv(code, count=days)
     try:
-        flows = fetch_flows(code, days=min(days, 200))
+        flows = fetch_flows(code, days=days)
         df = price.join(flows, how="left")
     except DataError as e:
         print(f"[경고] {e} -> 수급 점수는 제외하고 분석합니다.")

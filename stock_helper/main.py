@@ -4,7 +4,10 @@
   python main.py analyze 005930            # 종목 분석 + 매수/매도 의견
   python main.py analyze 005930 --chart    # 차트 PNG 저장
   python main.py scan watchlist.txt        # 관심종목 일괄 점수 랭킹
-  python main.py backtest 005930           # 점수 전략 과거 성과 검증
+  python main.py optimize universe.txt     # 과거 데이터로 승률 최적 설정 찾기 (100회+)
+  python main.py backtest 005930,000660    # 저장된 설정으로 백테스트
+  python main.py monitor watchlist.txt     # 장중 실시간 감시 + 모의매매
+  python main.py paper                     # 모의매매 승률 (100회 목표)
   python main.py analyze DEMO              # 네트워크 없이 가상 데이터로 시험
 """
 from __future__ import annotations
@@ -19,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backtest  # noqa: E402
 import data  # noqa: E402
 import indicators  # noqa: E402
+import realtime  # noqa: E402
 from signals import score_at, score_series  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -28,11 +32,11 @@ DISCLAIMER = ("※ 본 결과는 기술적 지표·수급 기반의 참고용 �
               "최종 판단과 책임은 본인에게 있습니다.")
 
 
-def load(code: str, days: int):
+def load(code: str, days: int, cache_hours: float = 0):
     if code.upper().startswith("DEMO"):
         seed = int(code[4:] or 7)
         return data.synthetic(days, seed=seed), f"가상종목{seed}"
-    return data.load(code, days)
+    return data.load(code, days, cache_hours=cache_hours)
 
 
 def fmt(v: float) -> str:
@@ -102,12 +106,7 @@ def _plan(s, risk):
 
 
 def cmd_scan(a):
-    if os.path.exists(a.watchlist):
-        with open(a.watchlist, encoding="utf-8") as f:
-            codes = [ln.split("#")[0].strip() for ln in f]
-    else:
-        codes = a.watchlist.split(",")
-    codes = [c for c in codes if c]
+    codes = read_codes(a.watchlist)
     rows = []
     for code in codes:
         try:
@@ -131,20 +130,91 @@ def cmd_scan(a):
     print(DISCLAIMER)
 
 
+def read_codes(arg: str) -> list[str]:
+    if os.path.exists(arg):
+        with open(arg, encoding="utf-8") as f:
+            codes = [ln.split("#")[0].strip() for ln in f]
+    else:
+        codes = arg.split(",")
+    return [c for c in codes if c]
+
+
+def _stat_line(st: dict) -> str:
+    if not st["n"]:
+        return "거래 없음"
+    return (f"{st['n']:>4}회 | 승률 {st['win']:5.1f}% | 평균 {st['avg']:+.2f}% | "
+            f"평균이익 {st['avg_win']:+.2f}% / 평균손실 {st['avg_loss']:+.2f}% | "
+            f"PF {st['pf']:.2f} | 최악 {st['worst']:+.1f}% | 최대연속손실 {st['max_losing']}")
+
+
 def cmd_backtest(a):
-    raw, name = load(a.code, a.days)
-    d = indicators.add_all(raw)
-    res = backtest.run(d, buy_th=a.buy, exit_th=a.exit, max_hold=a.hold)
-    print(f"{name} ({a.code}) 백테스트  {d.index[60].date()} ~ {d.index[-1].date()}")
-    print(f"  조건: 점수 ≥ {a.buy} 매수 / 점수 ≤ {a.exit} 또는 {a.hold}일 경과 시 매도, "
-          f"ATR 손절·목표가, 왕복비용 0.25%")
-    if res.trades.empty:
-        print("  거래 없음")
+    p = backtest.Params.load()
+    for k in ("buy_th", "exit_th", "tp_atr", "sl_atr", "max_hold"):
+        if getattr(a, k) is not None:
+            setattr(p, k, getattr(a, k))
+    codes = read_codes(a.codes)
+    trades = []
+    for code in codes:
+        raw, name = load(code, a.days, cache_hours=12)
+        trades += backtest.simulate(backtest.prepare(raw), p, code)
+    print(f"백테스트 {len(codes)}종목 | 설정 {p}")
+    t = pd.DataFrame(trades)
+    if not t.empty and a.show:
+        with pd.option_context("display.width", 200):
+            print(t.assign(ret=t.ret.round(2)).to_string(index=False))
+    print("  " + _stat_line(backtest.summarize(t)))
+
+
+def cmd_optimize(a):
+    codes = read_codes(a.codes)
+    datasets = {}
+    for n, code in enumerate(codes, 1):
+        try:
+            raw, name = load(code, a.days, cache_hours=12)
+            datasets[code] = backtest.prepare(raw)
+            print(f"  [{n}/{len(codes)}] {name}({code}) {len(raw)}일 준비 완료")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [{n}/{len(codes)}] {code} 실패: {e}")
+    if not datasets:
         return
-    with pd.option_context("display.unicode.east_asian_width", True, "display.width", 200):
-        print(res.trades.to_string(index=False))
-    print(f"  거래 {len(res.trades)}회 | 승률 {res.win_rate:.0f}% | 평균 {res.avg_return:+.2f}% | "
-          f"누적 {res.total_return:+.1f}% | MDD {res.mdd:.1f}% | 단순보유 {res.buy_hold:+.1f}%")
+    best, rows, cut = backtest.optimize(datasets, target_win=a.target, min_train=a.min_train)
+    print(f"\n조합 {len(rows)}개 시험 | 학습: ~{cut.date()} 이전 / 검증: {cut.date()} 이후")
+    top = sorted(rows, key=lambda r: (r["train"]["win"] if r["train"]["n"] >= a.min_train
+                                      and r["train"]["avg"] > 0 else -1), reverse=True)[:8]
+    print("\n[참고] 학습 구간 승률 상위 조합 (기대값 > 0 만)")
+    for r in top:
+        p = r["params"]
+        print(f"  매수≥{p.buy_th:<3} 익절 {p.tp_atr}ATR 손절 {p.sl_atr}ATR 보유 {p.max_hold:>2}일"
+              f" | 학습 {r['train']['win']:5.1f}% ({r['train']['n']}회, 평균 {r['train']['avg']:+.2f}%)"
+              f" | 검증 {r['test']['win']:5.1f}% ({r['test']['n']}회, 평균 {r['test']['avg']:+.2f}%)")
+    if best is None:
+        print("\n❌ 기대수익이 플러스인 조합이 없습니다. 종목/기간을 늘리거나 점수 로직을 수정하세요.")
+        return
+    p, tr, te = best["params"], best["train"], best["test"]
+    print("\n[선택된 설정]", p)
+    print("  학습 " + _stat_line(tr))
+    print("  검증 " + _stat_line(te))
+    total = tr["n"] + te["n"]
+    ok_n = total >= 100
+    ok_win = te["win"] >= a.target and tr["win"] >= a.target
+    print(f"\n  총 모의거래 {total}회 {'✅' if ok_n else '❌ (100회 미만: 종목이나 기간을 늘리세요)'}")
+    if ok_win:
+        print(f"  ✅ 학습·검증 모두 승률 {a.target:.0f}% 이상")
+    else:
+        print(f"  ⚠ 검증 승률 {te['win']:.1f}%: 목표 {a.target:.0f}% 미달. "
+              f"실전 기대치는 검증 숫자에 가깝습니다.")
+    if te["n"] and te["avg"] <= 0:
+        print("  ⚠ 검증 구간 평균수익이 마이너스: 실전 사용 비추천")
+    p.save(extra={"train": tr, "test": te, "split": str(cut.date()), "codes": codes})
+    print(f"  설정 저장: {backtest.PARAMS_PATH} (monitor/backtest 가 자동 사용)")
+
+
+def cmd_monitor(a):
+    realtime.monitor(read_codes(a.codes), backtest.Params.load(), a.interval, a.once, a.days)
+
+
+def cmd_paper(a):
+    realtime.paper_report(a.target_n)
 
 
 def save_chart(d: pd.DataFrame, name: str, code: str) -> str:
@@ -191,20 +261,34 @@ def save_chart(d: pd.DataFrame, name: str, code: str) -> str:
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="한국 주식 단기투자 도우미")
-    p.add_argument("--days", type=int, default=250, help="조회 거래일 수 (기본 250)")
+    p.add_argument("--days", type=int, default=500, help="조회 거래일 수 (기본 500 ≈ 2년)")
     sub = p.add_subparsers(dest="cmd", required=True)
     s1 = sub.add_parser("analyze", help="종목 분석")
     s1.add_argument("code", help="종목코드 6자리 (예: 005930) 또는 DEMO")
     s1.add_argument("--chart", action="store_true", help="차트 PNG 저장")
     s2 = sub.add_parser("scan", help="관심종목 랭킹")
     s2.add_argument("watchlist", help="종목코드 파일 경로 또는 쉼표 구분 코드")
-    s3 = sub.add_parser("backtest", help="점수 전략 백테스트")
-    s3.add_argument("code")
-    s3.add_argument("--buy", type=float, default=25, help="매수 점수 기준 (기본 25)")
-    s3.add_argument("--exit", type=float, default=-10, help="청산 점수 기준 (기본 -10)")
-    s3.add_argument("--hold", type=int, default=10, help="최대 보유일 (기본 10)")
+    s3 = sub.add_parser("backtest", help="전략 백테스트 (best_params.json 사용)")
+    s3.add_argument("codes", help="종목코드, 쉼표 구분 또는 파일 (예: universe.txt)")
+    s3.add_argument("--buy", dest="buy_th", type=float)
+    s3.add_argument("--exit", dest="exit_th", type=float)
+    s3.add_argument("--tp", dest="tp_atr", type=float, help="익절 ATR 배수")
+    s3.add_argument("--sl", dest="sl_atr", type=float, help="손절 ATR 배수")
+    s3.add_argument("--hold", dest="max_hold", type=int)
+    s3.add_argument("--show", action="store_true", help="거래 내역 출력")
+    s4 = sub.add_parser("optimize", help="과거 데이터로 승률 최적 설정 탐색")
+    s4.add_argument("codes", nargs="?", default="universe.txt")
+    s4.add_argument("--target", type=float, default=80, help="목표 승률 %% (기본 80)")
+    s4.add_argument("--min-train", type=int, default=70, help="학습 구간 최소 거래수")
+    s5 = sub.add_parser("monitor", help="장중 실시간 감시 + 모의매매 기록")
+    s5.add_argument("codes", nargs="?", default="watchlist.txt")
+    s5.add_argument("--interval", type=float, default=5, help="점검 간격(분)")
+    s5.add_argument("--once", action="store_true", help="1회만 점검 (장외 시간에도)")
+    s6 = sub.add_parser("paper", help="모의매매 성적 집계")
+    s6.add_argument("--target-n", type=int, default=100)
     a = p.parse_args(argv)
-    {"analyze": cmd_analyze, "scan": cmd_scan, "backtest": cmd_backtest}[a.cmd](a)
+    {"analyze": cmd_analyze, "scan": cmd_scan, "backtest": cmd_backtest,
+     "optimize": cmd_optimize, "monitor": cmd_monitor, "paper": cmd_paper}[a.cmd](a)
 
 
 if __name__ == "__main__":
