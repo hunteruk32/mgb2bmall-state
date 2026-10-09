@@ -76,6 +76,35 @@ def _num(s: str) -> float:
     return float(m.group(0).replace(",", "")) if m else np.nan
 
 
+def _decode(r: requests.Response) -> str:
+    """응답 인코딩 자동 판별 (네이버는 페이지에 따라 euc-kr / utf-8 혼재)."""
+    ctype = r.headers.get("Content-Type", "").lower()
+    head = r.content[:2000].lower()
+    if "utf-8" in ctype or b'charset="utf-8"' in head or b"charset=utf-8" in head:
+        return r.content.decode("utf-8", errors="replace")
+    return r.content.decode("euc-kr", errors="replace")
+
+
+def parse_frgn_html(html: str) -> list[dict]:
+    """finance.naver.com/item/frgn.naver 표 파싱.
+    행 구성: 날짜, 종가, 전일비, 등락률, 거래량, 기관, 외국인, 보유주수, 보유율"""
+    recs = []
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S):
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
+        if len(tds) < 7:
+            continue
+        date_txt = _clean(tds[0])
+        if not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", date_txt):
+            continue
+        recs.append({
+            "date": pd.Timestamp(date_txt.replace(".", "-")),
+            "inst": _num(_clean(tds[5])),
+            "foreign": _num(_clean(tds[6])),
+            "foreign_ratio": _num(_clean(tds[8])) if len(tds) > 8 else np.nan,
+        })
+    return recs
+
+
 def fetch_flows_naver(code: str, pages: int = 8) -> pd.DataFrame:
     """기관/외국인 일별 순매매량(주), 외국인 보유율(%). 한 페이지 = 약 20거래일."""
     recs = []
@@ -83,30 +112,77 @@ def fetch_flows_naver(code: str, pages: int = 8) -> pd.DataFrame:
         url = f"https://finance.naver.com/item/frgn.naver?code={code}&page={page}"
         r = requests.get(url, headers=UA, timeout=TIMEOUT)
         r.raise_for_status()
-        html = r.content.decode("euc-kr", errors="replace")
-        found = 0
-        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S):
-            tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
-            if len(tds) < 9:
-                continue
-            date_txt = _clean(tds[0])
-            if not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", date_txt):
-                continue
-            # 날짜, 종가, 전일비, 등락률, 거래량, 기관, 외국인, 보유주수, 보유율
-            recs.append({
-                "date": pd.Timestamp(date_txt.replace(".", "-")),
-                "inst": _num(_clean(tds[5])),
-                "foreign": _num(_clean(tds[6])),
-                "foreign_ratio": _num(_clean(tds[8])),
-            })
-            found += 1
-        if found == 0:
+        found = parse_frgn_html(_decode(r))
+        if not found:
             break
+        recs += found
         time.sleep(0.15)
     if not recs:
         raise DataError("네이버 수급 데이터가 비어 있습니다")
     df = pd.DataFrame(recs).drop_duplicates("date").set_index("date").sort_index()
     return df
+
+
+MOBILE_UA = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                           "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+             "Referer": "https://m.stock.naver.com/"}
+
+
+def _find_key(row: dict, *must: str) -> str | None:
+    for k in row:
+        kl = k.lower()
+        if all(m in kl for m in must):
+            return k
+    return None
+
+
+def parse_mobile_trend(js) -> list[dict]:
+    """m.stock.naver.com /api/stock/{code}/trend JSON 파싱 (키 이름을 유연하게 탐색)."""
+    rows = js if isinstance(js, list) else next(
+        (v for v in (js or {}).values() if isinstance(v, list)), [])
+    recs = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        kd = _find_key(row, "bizdate") or _find_key(row, "date")
+        kf = _find_key(row, "foreign", "pure") or _find_key(row, "foreign", "net")
+        ki = _find_key(row, "organ", "pure") or _find_key(row, "institution", "net")
+        kp = _find_key(row, "individual", "pure") or _find_key(row, "individual", "net")
+        kr = _find_key(row, "foreign", "ratio")
+        if not (kd and kf and ki):
+            continue
+        d = re.sub(r"\D", "", str(row[kd]))[:8]
+        if len(d) != 8:
+            continue
+        rec = {"date": pd.Timestamp(d), "inst": _num(str(row[ki])),
+               "foreign": _num(str(row[kf]))}
+        if kp:
+            rec["retail"] = _num(str(row[kp]))
+        if kr:
+            rec["foreign_ratio"] = _num(str(row[kr]))
+        recs.append(rec)
+    return recs
+
+
+def fetch_flows_naver_mobile(code: str, days: int = 160) -> pd.DataFrame:
+    """네이버 모바일 증권 투자자별 매매동향 (외국인/기관/개인 순매수 수량)."""
+    recs, bizdate = [], None
+    for _ in range(max(1, int(np.ceil(days / 60)))):
+        url = f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=60"
+        if bizdate:
+            url += f"&bizdate={bizdate}"
+        r = requests.get(url, headers=MOBILE_UA, timeout=TIMEOUT)
+        r.raise_for_status()
+        found = parse_mobile_trend(r.json())
+        new = [x for x in found if not recs or x["date"] < min(y["date"] for y in recs)]
+        if not new:
+            break
+        recs += new
+        bizdate = (min(x["date"] for x in new) - pd.Timedelta(days=1)).strftime("%Y%m%d")
+        time.sleep(0.15)
+    if not recs:
+        raise DataError("네이버 모바일 수급 데이터가 비어 있습니다")
+    return pd.DataFrame(recs).drop_duplicates("date").set_index("date").sort_index()
 
 
 def fetch_flows_pykrx(code: str, days: int = 160) -> pd.DataFrame:
@@ -126,13 +202,15 @@ def fetch_flows_pykrx(code: str, days: int = 160) -> pd.DataFrame:
 
 def fetch_flows(code: str, days: int = 160) -> pd.DataFrame:
     pages = max(1, int(np.ceil(days / 20)))
-    try:
-        return fetch_flows_naver(code, pages=pages)
-    except Exception as e1:  # noqa: BLE001
+    errors = []
+    for label, fn in (("naver", lambda: fetch_flows_naver(code, pages=pages)),
+                      ("naver_mobile", lambda: fetch_flows_naver_mobile(code, days=days)),
+                      ("pykrx", lambda: fetch_flows_pykrx(code, days=days))):
         try:
-            return fetch_flows_pykrx(code, days=days)
-        except Exception as e2:  # noqa: BLE001
-            raise DataError(f"수급 조회 실패 ({code}): naver={e1!r}, pykrx={e2!r}") from e2
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{label}={e!r}")
+    raise DataError(f"수급 조회 실패 ({code}): " + ", ".join(errors))
 
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")

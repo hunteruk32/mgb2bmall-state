@@ -31,6 +31,7 @@ def _resp(text):
     r = mock.Mock()
     r.content = text.encode("euc-kr")
     r.raise_for_status = lambda: None
+    r.headers = {}
     return r
 
 
@@ -153,3 +154,20 @@ def test_params_roundtrip(tmp_path):
     backtest.Params(tp_atr=0.7, split=False).save(path, extra={"split_date": "2026-03-16"})
     q = backtest.Params.load(path)
     assert q.tp_atr == 0.7 and q.split is False and q.market_filter is True
+
+
+def test_parse_mobile_trend_flexible_keys():
+    js = [{"bizdate": "20261008", "foreignerPureBuyQuant": "-1,024,500",
+           "organPureBuyQuant": "+512,300", "individualPureBuyQuant": "+512,200",
+           "foreignerHoldRatio": "50.12%", "closePrice": "263,000"}]
+    r = data.parse_mobile_trend(js)
+    assert r[0]["date"] == pd.Timestamp("2026-10-08")
+    assert r[0]["foreign"] == -1024500 and r[0]["inst"] == 512300 and r[0]["retail"] == 512200
+    assert data.parse_mobile_trend({"result": js})[0]["foreign_ratio"] == 50.12
+
+
+def test_flows_fallback_chain():
+    with mock.patch("data.fetch_flows_naver", side_effect=data.DataError("x")), \
+            mock.patch("data.fetch_flows_naver_mobile",
+                       return_value=pd.DataFrame({"inst": [1.0]})) as m:
+        assert len(data.fetch_flows("005930")) == 1 and m.called
