@@ -155,7 +155,7 @@ def cmd_scan(a):
 
 def read_codes(arg: str) -> list[str]:
     if os.path.exists(arg):
-        with open(arg, encoding="utf-8") as f:
+        with open(arg, encoding="utf-8-sig") as f:
             codes = [ln.split("#")[0].strip() for ln in f]
     else:
         codes = arg.split(",")

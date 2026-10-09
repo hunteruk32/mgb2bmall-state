@@ -44,7 +44,7 @@ def market_open(t: datetime) -> bool:
 def read_ledger(path: str = LEDGER) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame(columns=COLS)
-    df = pd.read_csv(path, dtype={"code": str})
+    df = pd.read_csv(path, dtype={"code": str}, encoding="utf-8-sig")
     for c in COLS:
         if c not in df:
             df[c] = np.nan
