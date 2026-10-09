@@ -1,9 +1,12 @@
 """장중 실시간 감시 + 모의매매(페이퍼 트레이딩) 기록.
 
 - interval 분마다 관심종목 시세를 새로 받아 점수를 다시 계산
-- 보유 중 모의 포지션: 현재가가 손절/익절가에 닿으면 즉시 청산 기록
+- 보유 중 모의 포지션: 현재가가 손절가에 닿으면 즉시 청산
+  분할 익절(C): 1차 익절가 도달 시 절반 매도 + 손절가를 본전으로 상향,
+                2차 익절가 또는 본전 이탈 시 나머지 매도
 - 신규 진입: 백테스트와 같은 조건(장 마감 점수)으로 맞추기 위해
   15:15 이후에만 '매수' 기록 (그 전에는 '매수 후보' 알림만)
+  시장 필터(B): 코스피 약세 조건이면 신규 진입 금지
 - 점수 하락/보유기간 만료 청산은 다음날 장 시작 후 첫 확인 때 현재가로 기록
 - 모든 거래는 paper_trades.csv 에 저장 -> `python main.py paper` 로 승률 집계
 """
@@ -19,13 +22,14 @@ import pandas as pd
 
 import data
 import indicators
+import market
 from backtest import Params, summarize
 from signals import score_at
 
 KST = ZoneInfo("Asia/Seoul")
 LEDGER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_trades.csv")
-COLS = ["code", "name", "entry_date", "entry", "stop", "target", "score",
-        "status", "exit_date", "exit", "ret", "reason"]
+COLS = ["code", "name", "entry_date", "entry", "stop", "target", "target2", "half_ret",
+        "score", "status", "exit_date", "exit", "ret", "reason"]
 OPEN_T, ENTRY_T, CLOSE_T = dtime(9, 0), dtime(15, 15), dtime(15, 30)
 
 
@@ -40,7 +44,11 @@ def market_open(t: datetime) -> bool:
 def read_ledger(path: str = LEDGER) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame(columns=COLS)
-    return pd.read_csv(path, dtype={"code": str})
+    df = pd.read_csv(path, dtype={"code": str})
+    for c in COLS:
+        if c not in df:
+            df[c] = np.nan
+    return df
 
 
 def write_ledger(df: pd.DataFrame, path: str = LEDGER):
@@ -52,8 +60,13 @@ def _held_days(entry_date: str, today: datetime) -> int:
 
 
 def step(codes: list[str], p: Params, loader, t: datetime, ledger: pd.DataFrame,
-         log=print) -> pd.DataFrame:
-    """한 번의 점검. loader(code) -> (지표 계산 전 DataFrame, 종목명)."""
+         log=print, mkt: tuple[bool, str] = (True, "")) -> pd.DataFrame:
+    """한 번의 점검. loader(code) -> (지표 계산 전 DataFrame, 종목명).
+    mkt: (신규 매수 가능 여부, 사유) — 시장 필터 결과."""
+    mkt_ok = mkt[0] or not p.market_filter
+    if not mkt_ok:
+        log(f"  ⛔ 시장 필터: 신규 매수 중단 ({mkt[1]})")
+    stamp = t.strftime("%Y-%m-%d %H:%M")
     rows = []
     for code in codes:
         try:
@@ -70,32 +83,54 @@ def step(codes: list[str], p: Params, loader, t: datetime, ledger: pd.DataFrame,
         if is_open.any():                                   # ---- 보유 포지션 관리
             k = ledger.index[is_open][0]
             pos = ledger.loc[k]
+            half = None if pd.isna(pos.half_ret) else float(pos.half_ret)
+            t2 = pos.target2 if not pd.isna(pos.target2) else np.inf
             why = None
             if price <= pos.stop:
-                why = "손절"
-            elif price >= pos.target:
-                why = "익절"
-            elif t.time() >= OPEN_T and pd.Timestamp(pos.entry_date).date() < t.date():
+                why = "손절" if half is None else "1차익절+본전"
+            elif half is None and price >= pos.target:
+                if p.split:
+                    half = price / pos.entry - 1
+                    be = round(pos.entry * (1 + p.cost))
+                    ledger.loc[k, ["half_ret", "stop"]] = [round(half, 6), be]
+                    log(f"  💰 [1차 익절] {name}({code}) {price:,.0f}원 절반 매도 "
+                        f"({half * 100:+.2f}%), 남은 절반 손절가 → 본전 {be:,}원")
+                    if price >= t2:
+                        why = "2차익절"
+                else:
+                    why = "익절"
+            elif half is not None and price >= t2:
+                why = "2차익절"
+            if not why and pd.Timestamp(pos.entry_date).date() < t.date():
                 prev_score = score_at(d, -2).score if d.index[-1].date() == t.date() else s.score
                 if prev_score <= p.exit_th:
                     why = "점수하락"
                 elif _held_days(pos.entry_date, t) > p.max_hold:
                     why = "기간만료"
+                if why and half is not None:
+                    why = "1차익절+" + why
             if why:
-                ret = (price / pos.entry - 1 - p.cost) * 100
+                r2 = price / pos.entry - 1
+                ret = ((r2 if half is None else 0.5 * half + 0.5 * r2) - p.cost) * 100
                 ledger.loc[k, ["status", "exit_date", "exit", "ret", "reason"]] = \
-                    ["closed", t.strftime("%Y-%m-%d %H:%M"), price, round(ret, 2), why]
-                log(f"  🔔 [모의 청산] {name}({code}) {price:,.0f}원 {why} → {ret:+.2f}%")
+                    ["closed", stamp, price, round(ret, 2), why]
+                log(f"  🔔 [모의 청산] {name}({code}) {price:,.0f}원 {why} → 총 {ret:+.2f}%")
         elif s.score >= p.buy_th:                           # ---- 신규 진입
-            if t.time() >= ENTRY_T and market_open(t):
-                new = dict(code=code, name=name, entry_date=t.strftime("%Y-%m-%d %H:%M"),
-                           entry=price, stop=round(price - p.sl_atr * atr),
-                           target=round(price + p.tp_atr * atr), score=s.score,
-                           status="open", exit_date="", exit=np.nan, ret=np.nan, reason="")
+            if not mkt_ok:
+                log(f"  ✋ [매수 보류] {name}({code}) 점수 {s.score:+.0f} — 시장 필터")
+            elif t.time() >= ENTRY_T and market_open(t):
+                new = dict(code=code, name=name, entry_date=stamp, entry=price,
+                           stop=round(price - p.sl_atr * atr),
+                           target=round(price + p.tp_atr * atr),
+                           target2=round(price + p.tp2_atr * atr) if p.split else np.nan,
+                           half_ret=np.nan, score=s.score, status="open", exit_date="",
+                           exit=np.nan, ret=np.nan, reason="")
                 ledger = ledger.reset_index(drop=True)
                 ledger.loc[len(ledger)] = new
+                tp = (f"1차 {new['target']:,}(절반) / 2차 {new['target2']:,}" if p.split
+                      else f"익절 {new['target']:,}")
                 log(f"  🟢 [모의 매수] {name}({code}) {price:,.0f}원 점수 {s.score:+.0f} "
-                    f"손절 {new['stop']:,} / 익절 {new['target']:,}")
+                    f"손절 {new['stop']:,} / {tp}")
             else:
                 log(f"  👀 [매수 후보] {name}({code}) {price:,.0f}원 점수 {s.score:+.0f} "
                     f"(15:15 이후 유지되면 진입)")
@@ -115,6 +150,19 @@ def monitor(codes: list[str], p: Params, interval_min: float = 5, once: bool = F
         base, name = data.load(code, days, cache_hours=12)
         return data.refresh_price(base, code), name
 
+    demo = all(c.upper().startswith("DEMO") for c in codes)
+
+    def market_state() -> tuple[bool, str]:
+        if not p.market_filter:
+            return True, "필터 꺼짐"
+        try:
+            idx = data.load_index("KOSPI", 60, demo=demo)
+            if not demo:
+                idx = data.refresh_price(idx, "KOSPI")
+            return market.status(market.flags(idx))
+        except Exception as e:  # noqa: BLE001
+            return True, f"지수 조회 실패({e}) -> 필터 미적용"
+
     print(f"감시 시작: {len(codes)}종목, {interval_min}분 간격, 설정 {p}")
     while True:
         t = now()
@@ -123,7 +171,7 @@ def monitor(codes: list[str], p: Params, interval_min: float = 5, once: bool = F
                   f"--once 로 1회 점검만 할 수 있습니다.")
             return
         print(f"\n[{t:%Y-%m-%d %H:%M:%S}] 점검")
-        ledger = step(codes, p, loader, t, read_ledger())
+        ledger = step(codes, p, loader, t, read_ledger(), mkt=market_state())
         write_ledger(ledger)
         if once:
             return

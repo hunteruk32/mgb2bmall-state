@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backtest  # noqa: E402
 import data  # noqa: E402
 import indicators  # noqa: E402
+import market  # noqa: E402
 import realtime  # noqa: E402
 from signals import score_at, score_series  # noqa: E402
 
@@ -39,6 +40,17 @@ def load(code: str, days: int, cache_hours: float = 0):
     return data.load(code, days, cache_hours=cache_hours)
 
 
+def market_flags(codes: list[str], days: int, index: str = "KOSPI"):
+    """시장 필터(B)용 지수 플래그. 실패 시 None (필터 없이 진행)."""
+    demo = all(c.upper().startswith("DEMO") for c in codes)
+    try:
+        idx = data.load_index(index, days + 30, cache_hours=1, demo=demo)
+        return market.flags(idx, "코스피" if index == "KOSPI" else "코스닥")
+    except Exception as e:  # noqa: BLE001
+        print(f"[경고] {index} 지수 조회 실패 -> 시장 필터 없이 진행: {e}")
+        return None
+
+
 def fmt(v: float) -> str:
     return f"{v:,.0f}"
 
@@ -48,6 +60,9 @@ def cmd_analyze(a):
     d = indicators.add_all(raw)
     s = score_at(d)
     r = d.iloc[-1]
+    p = backtest.Params.load()
+    mk = market_flags([a.code], a.days) if p.market_filter else None
+    mkt_ok, mkt_msg = market.status(mk) if mk is not None else (True, "필터 꺼짐/정보 없음")
     bar = "=" * 64
     print(bar)
     print(f" {name} ({a.code})   기준일 {s.date.date()}   종가 {fmt(s.close)}원 "
@@ -55,6 +70,7 @@ def cmd_analyze(a):
     print(bar)
     print(f" 종합 점수 : {s.score:+.1f} / 100      의견 : 【 {s.opinion} 】")
     print(" 세부 점수 : " + "  ".join(f"{k} {v:+g}" for k, v in s.parts.items()))
+    print(f" 시장 필터 : {'✅ 매수 가능' if mkt_ok else '⛔ 신규 매수 금지'} ({mkt_msg})")
     print("-" * 64)
     print(f" RSI {r.rsi:.1f} | MACD hist {r.macd_hist:+.1f} | MFI {r.mfi:.0f} | "
           f"거래량비 {r.vol_ratio:.2f}배 | ATR {fmt(r.atr)}")
@@ -78,14 +94,17 @@ def cmd_analyze(a):
         for x in s.exit_alerts:
             print("  ⛔ " + x)
     print("-" * 64)
-    risk = s.close - s.stop
-    print(" [매매 가이드] (ATR 기반)")
-    if s.score < 25:
-        print(f"  신규 매수 비추천. 보유 중이라면 손절 기준 {fmt(s.stop)}원 "
-              f"({(s.stop / s.close - 1) * 100:+.1f}%) 이탈 시 정리")
+    print(f" [매매 가이드] (저장된 설정: 매수≥{p.buy_th:g}, 손절 {p.sl_atr:g}ATR, "
+          f"익절 {p.tp_atr:g}/{p.tp2_atr:g}ATR, 최대 {p.max_hold}일)")
+    stop = s.close - p.sl_atr * r.atr
+    if s.score < p.buy_th:
+        print(f"  점수 {s.score:+.0f} < 기준 {p.buy_th:g}: 신규 매수 안 함. "
+              f"보유 중이라면 손절 기준 {fmt(stop)}원 ({(stop / s.close - 1) * 100:+.1f}%)")
+    elif not mkt_ok:
+        print(f"  점수는 매수 기준 이상이지만 시장 필터({mkt_msg})로 신규 매수 보류")
     else:
-        print(f"  진입 참고가 : {fmt(s.close)}원 (다음날 시가~종가 부근 분할)")
-        _plan(s, risk)
+        print(f"  진입 참고가 : {fmt(s.close)}원 (다음날 시가 부근)")
+        _plan(s.close, r.atr, p)
     print(" [최근 5일 점수 추이]")
     print("  " + "  ".join(f"{k.strftime('%m/%d')}:{v:+.0f}"
                            for k, v in score_series(d, len(d) - 5).items()))
@@ -96,13 +115,17 @@ def cmd_analyze(a):
         print(f"차트 저장: {path}")
 
 
-def _plan(s, risk):
-    print(f"  손절가      : {fmt(s.stop)}원 ({(s.stop / s.close - 1) * 100:+.1f}%)")
-    print(f"  1차 목표가  : {fmt(s.target1)}원 ({(s.target1 / s.close - 1) * 100:+.1f}%) "
-          f"→ 절반 익절")
-    print(f"  2차 목표가  : {fmt(s.target2)}원 ({(s.target2 / s.close - 1) * 100:+.1f}%)")
-    if risk > 0:
-        print(f"  손익비      : 1 : {(s.target2 - s.close) / risk:.1f}")
+def _plan(close: float, atr: float, p):
+    stop, t1, t2 = close - p.sl_atr * atr, close + p.tp_atr * atr, close + p.tp2_atr * atr
+    pct = lambda v: f"{(v / close - 1) * 100:+.1f}%"  # noqa: E731
+    print(f"  손절가      : {fmt(stop)}원 ({pct(stop)})")
+    if p.split:
+        print(f"  1차 익절    : {fmt(t1)}원 ({pct(t1)}) → 절반 매도 후 남은 절반 손절가를 "
+              f"본전 {fmt(close * (1 + p.cost))}원으로 올림")
+        print(f"  2차 익절    : {fmt(t2)}원 ({pct(t2)}) → 나머지 매도")
+    else:
+        print(f"  익절가      : {fmt(t1)}원 ({pct(t1)})")
+    print(f"  그 외 청산  : 점수 ≤ {p.exit_th:g} 또는 {p.max_hold}일 경과 시 다음날 시가")
 
 
 def cmd_scan(a):
@@ -149,14 +172,19 @@ def _stat_line(st: dict) -> str:
 
 def cmd_backtest(a):
     p = backtest.Params.load()
-    for k in ("buy_th", "exit_th", "tp_atr", "sl_atr", "max_hold"):
+    for k in ("buy_th", "exit_th", "tp_atr", "tp2_atr", "sl_atr", "max_hold"):
         if getattr(a, k) is not None:
             setattr(p, k, getattr(a, k))
+    if a.no_market:
+        p.market_filter = False
+    if a.no_split:
+        p.split = False
     codes = read_codes(a.codes)
+    mk = market_flags(codes, a.days)
     trades = []
     for code in codes:
         raw, name = load(code, a.days, cache_hours=12)
-        trades += backtest.simulate(backtest.prepare(raw), p, code)
+        trades += backtest.simulate(backtest.prepare(raw, mk), p, code)
     print(f"백테스트 {len(codes)}종목 | 설정 {p}")
     t = pd.DataFrame(trades)
     if not t.empty and a.show:
@@ -167,11 +195,14 @@ def cmd_backtest(a):
 
 def cmd_optimize(a):
     codes = read_codes(a.codes)
+    mk = market_flags(codes, a.days)
+    if mk is not None:
+        print(f"  시장 필터: 기간 중 {(~mk.mkt_ok).mean() * 100:.0f}%의 날이 신규 매수 금지")
     datasets = {}
     for n, code in enumerate(codes, 1):
         try:
             raw, name = load(code, a.days, cache_hours=12)
-            datasets[code] = backtest.prepare(raw)
+            datasets[code] = backtest.prepare(raw, mk)
             print(f"  [{n}/{len(codes)}] {name}({code}) {len(raw)}일 준비 완료")
         except Exception as e:  # noqa: BLE001
             print(f"  [{n}/{len(codes)}] {code} 실패: {e}")
@@ -184,7 +215,8 @@ def cmd_optimize(a):
     print("\n[참고] 학습 구간 승률 상위 조합 (기대값 > 0 만)")
     for r in top:
         p = r["params"]
-        print(f"  매수≥{p.buy_th:<3} 익절 {p.tp_atr}ATR 손절 {p.sl_atr}ATR 보유 {p.max_hold:>2}일"
+        print(f"  매수≥{p.buy_th:<3} 익절 {p.tp_atr}/{p.tp2_atr}ATR 손절 {p.sl_atr}ATR "
+              f"보유 {p.max_hold:>2}일"
               f" | 학습 {r['train']['win']:5.1f}% ({r['train']['n']}회, 평균 {r['train']['avg']:+.2f}%)"
               f" | 검증 {r['test']['win']:5.1f}% ({r['test']['n']}회, 평균 {r['test']['avg']:+.2f}%)")
     if best is None:
@@ -205,7 +237,12 @@ def cmd_optimize(a):
               f"실전 기대치는 검증 숫자에 가깝습니다.")
     if te["n"] and te["avg"] <= 0:
         print("  ⚠ 검증 구간 평균수익이 마이너스: 실전 사용 비추천")
-    p.save(extra={"train": tr, "test": te, "split": str(cut.date()), "codes": codes})
+    print("\n[B·C 효과 비교] 같은 설정에서 시장필터/분할익절을 켜고 끈 결과")
+    for label, a_tr, a_te in backtest.ablation(datasets, p, cut):
+        print(f"  {label:<12} 학습 {a_tr['win']:5.1f}% ({a_tr['n']}회, 평균 {a_tr['avg']:+.2f}%)"
+              f" | 검증 {a_te['win']:5.1f}% ({a_te['n']}회, 평균 {a_te['avg']:+.2f}%,"
+              f" 최악 {a_te['worst']:+.1f}%)")
+    p.save(extra={"train": tr, "test": te, "split_date": str(cut.date()), "codes": codes})
     print(f"  설정 저장: {backtest.PARAMS_PATH} (monitor/backtest 가 자동 사용)")
 
 
@@ -272,7 +309,10 @@ def main(argv=None):
     s3.add_argument("codes", help="종목코드, 쉼표 구분 또는 파일 (예: universe.txt)")
     s3.add_argument("--buy", dest="buy_th", type=float)
     s3.add_argument("--exit", dest="exit_th", type=float)
-    s3.add_argument("--tp", dest="tp_atr", type=float, help="익절 ATR 배수")
+    s3.add_argument("--tp", dest="tp_atr", type=float, help="1차 익절 ATR 배수")
+    s3.add_argument("--tp2", dest="tp2_atr", type=float, help="2차 익절 ATR 배수")
+    s3.add_argument("--no-market", action="store_true", help="시장 필터(B) 끄기")
+    s3.add_argument("--no-split", action="store_true", help="분할 익절(C) 끄기")
     s3.add_argument("--sl", dest="sl_atr", type=float, help="손절 ATR 배수")
     s3.add_argument("--hold", dest="max_hold", type=int)
     s3.add_argument("--show", action="store_true", help="거래 내역 출력")

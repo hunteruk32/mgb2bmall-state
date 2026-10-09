@@ -194,3 +194,40 @@ def synthetic(days: int = 250, seed: int = 7, trend: float = 0.0008) -> pd.DataF
     return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close,
                          "volume": vol.round(), "inst": inst, "foreign": foreign},
                         index=pd.DatetimeIndex(idx, name="date"))
+
+
+# ---------------------------------------------------------------- 지수 (시장 필터용)
+INDEX_PYKRX = {"KOSPI": "1001", "KOSDAQ": "2001"}
+
+
+def fetch_index(name: str = "KOSPI", count: int = 300) -> pd.DataFrame:
+    """코스피/코스닥 지수 일봉 (close 포함). 네이버 -> pykrx 순."""
+    try:
+        df, _ = fetch_ohlcv(name, count=count)
+        return df
+    except DataError:
+        pass
+    from pykrx import stock
+    end = pd.Timestamp.today()
+    start = end - pd.Timedelta(days=int(count * 1.6))
+    df = stock.get_index_ohlcv(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"),
+                               INDEX_PYKRX[name])
+    df = df.rename(columns={"시가": "open", "고가": "high", "저가": "low",
+                            "종가": "close", "거래량": "volume"})
+    df.index.name = "date"
+    return df[["open", "high", "low", "close", "volume"]].astype(float).tail(count)
+
+
+def load_index(name: str = "KOSPI", count: int = 500, cache_hours: float = 0,
+               demo: bool = False) -> pd.DataFrame:
+    if demo:  # 길이와 무관하게 같은 가상 지수가 나오도록 고정 길이로 만든 뒤 자름
+        return synthetic(max(count, 1000), seed=999, trend=0.0003).tail(count)
+    path = os.path.join(CACHE_DIR, f"INDEX_{name}_{count}.csv")
+    if cache_hours > 0 and os.path.exists(path) and \
+            time.time() - os.path.getmtime(path) < cache_hours * 3600:
+        return pd.read_csv(path, index_col="date", parse_dates=["date"])
+    df = fetch_index(name, count)
+    if cache_hours > 0:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        df.to_csv(path)
+    return df
