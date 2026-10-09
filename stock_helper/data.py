@@ -1,0 +1,168 @@
+"""시세(OHLCV) 및 투자자별 수급 데이터 수집.
+
+기본 소스: 네이버 금융 (로그인 불필요)
+  - 일봉:   fchart.stock.naver.com (XML)
+  - 수급:   finance.naver.com/item/frgn.naver (기관/외국인 일별 순매매량)
+보조 소스: pykrx (설치되어 있고 KRX 접속이 가능한 경우, 개인 순매수까지 제공)
+"""
+from __future__ import annotations
+
+import re
+import time
+
+import numpy as np
+import pandas as pd
+import requests
+
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      "Referer": "https://finance.naver.com/"}
+TIMEOUT = 10
+
+
+class DataError(RuntimeError):
+    pass
+
+
+# ---------------------------------------------------------------- 시세(일봉)
+def fetch_ohlcv(code: str, count: int = 300) -> tuple[pd.DataFrame, str]:
+    """일봉 OHLCV와 종목명을 반환. index=날짜, columns=open/high/low/close/volume"""
+    url = ("https://fchart.stock.naver.com/sise.nhn"
+           f"?symbol={code}&timeframe=day&count={count}&requestType=0")
+    try:
+        r = requests.get(url, headers=UA, timeout=TIMEOUT)
+        r.raise_for_status()
+        text = r.content.decode("euc-kr", errors="replace")
+        rows = re.findall(r'<item data="([^"]+)"', text)
+        if not rows:
+            raise DataError("네이버 일봉 응답이 비어 있습니다")
+        m = re.search(r'name="([^"]*)"', text)
+        name = m.group(1) if m else code
+        recs = []
+        for row in rows:
+            d, o, h, l, c, v = row.split("|")[:6]
+            recs.append((pd.Timestamp(d), float(o), float(h), float(l), float(c), float(v)))
+        df = pd.DataFrame(recs, columns=["date", "open", "high", "low", "close", "volume"])
+        df = df.set_index("date").sort_index()
+        df = df[df["close"] > 0]
+        return df, name
+    except (requests.RequestException, DataError) as e:
+        naver_err = e
+
+    # 보조: pykrx
+    try:
+        from pykrx import stock
+        end = pd.Timestamp.today()
+        start = end - pd.Timedelta(days=int(count * 1.6))
+        df = stock.get_market_ohlcv(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), code)
+        df = df.rename(columns={"시가": "open", "고가": "high", "저가": "low",
+                                "종가": "close", "거래량": "volume"})
+        df = df[["open", "high", "low", "close", "volume"]].astype(float)
+        df.index.name = "date"
+        name = stock.get_market_ticker_name(code)
+        return df.tail(count), name
+    except Exception as e:  # noqa: BLE001
+        raise DataError(f"시세 조회 실패 ({code}): naver={naver_err!r}, pykrx={e!r}") from e
+
+
+# ---------------------------------------------------------------- 수급
+def _clean(html: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
+
+
+def _num(s: str) -> float:
+    m = re.search(r"[-+]?[\d,]+(?:\.\d+)?", s)
+    return float(m.group(0).replace(",", "")) if m else np.nan
+
+
+def fetch_flows_naver(code: str, pages: int = 8) -> pd.DataFrame:
+    """기관/외국인 일별 순매매량(주), 외국인 보유율(%). 한 페이지 = 약 20거래일."""
+    recs = []
+    for page in range(1, pages + 1):
+        url = f"https://finance.naver.com/item/frgn.naver?code={code}&page={page}"
+        r = requests.get(url, headers=UA, timeout=TIMEOUT)
+        r.raise_for_status()
+        html = r.content.decode("euc-kr", errors="replace")
+        found = 0
+        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S):
+            tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
+            if len(tds) < 9:
+                continue
+            date_txt = _clean(tds[0])
+            if not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", date_txt):
+                continue
+            # 날짜, 종가, 전일비, 등락률, 거래량, 기관, 외국인, 보유주수, 보유율
+            recs.append({
+                "date": pd.Timestamp(date_txt.replace(".", "-")),
+                "inst": _num(_clean(tds[5])),
+                "foreign": _num(_clean(tds[6])),
+                "foreign_ratio": _num(_clean(tds[8])),
+            })
+            found += 1
+        if found == 0:
+            break
+        time.sleep(0.15)
+    if not recs:
+        raise DataError("네이버 수급 데이터가 비어 있습니다")
+    df = pd.DataFrame(recs).drop_duplicates("date").set_index("date").sort_index()
+    return df
+
+
+def fetch_flows_pykrx(code: str, days: int = 160) -> pd.DataFrame:
+    """pykrx 투자자별 순매수 '거래량'(주). 개인 포함."""
+    from pykrx import stock
+    end = pd.Timestamp.today()
+    start = end - pd.Timedelta(days=int(days * 1.6))
+    df = stock.get_market_trading_volume_by_date(
+        start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), code)
+    out = pd.DataFrame(index=df.index)
+    out["inst"] = df["기관합계"]
+    out["foreign"] = df["외국인합계"]
+    out["retail"] = df["개인"]
+    out.index.name = "date"
+    return out.astype(float)
+
+
+def fetch_flows(code: str, days: int = 160) -> pd.DataFrame:
+    pages = max(1, int(np.ceil(days / 20)))
+    try:
+        return fetch_flows_naver(code, pages=pages)
+    except Exception as e1:  # noqa: BLE001
+        try:
+            return fetch_flows_pykrx(code, days=days)
+        except Exception as e2:  # noqa: BLE001
+            raise DataError(f"수급 조회 실패 ({code}): naver={e1!r}, pykrx={e2!r}") from e2
+
+
+def load(code: str, days: int = 250) -> tuple[pd.DataFrame, str]:
+    """시세 + 수급을 합친 DataFrame. 수급 조회 실패 시 시세만 반환(수급 컬럼 NaN)."""
+    price, name = fetch_ohlcv(code, count=days)
+    try:
+        flows = fetch_flows(code, days=min(days, 200))
+        df = price.join(flows, how="left")
+    except DataError as e:
+        print(f"[경고] {e} -> 수급 점수는 제외하고 분석합니다.")
+        df = price.copy()
+        df["inst"] = np.nan
+        df["foreign"] = np.nan
+    return df, name
+
+
+# ---------------------------------------------------------------- 오프라인 데모
+def synthetic(days: int = 250, seed: int = 7, trend: float = 0.0008) -> pd.DataFrame:
+    """네트워크 없이 기능을 시험해 볼 수 있는 가상 데이터."""
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=days)
+    ret = rng.normal(trend, 0.02, days)
+    close = 50000 * np.exp(np.cumsum(ret))
+    open_ = close * (1 + rng.normal(0, 0.006, days))
+    high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.008, days)))
+    low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.008, days)))
+    vol = rng.lognormal(13, 0.4, days) * (1 + 8 * np.abs(ret))
+    # 수급이 가격을 약간 선행하도록 생성
+    lead = np.roll(ret, -1)
+    foreign = (lead * 4e6 + rng.normal(0, 3e4, days)).round()
+    inst = (lead * 3e6 + rng.normal(0, 3e4, days)).round()
+    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close,
+                         "volume": vol.round(), "inst": inst, "foreign": foreign},
+                        index=pd.DatetimeIndex(idx, name="date"))
