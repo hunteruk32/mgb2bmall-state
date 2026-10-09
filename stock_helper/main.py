@@ -94,16 +94,18 @@ def cmd_analyze(a):
         for x in s.exit_alerts:
             print("  ⛔ " + x)
     print("-" * 64)
-    print(f" [매매 가이드] (저장된 설정: 매수≥{p.buy_th:g}, 손절 {p.sl_atr:g}ATR, "
-          f"익절 {p.tp_atr:g}/{p.tp2_atr:g}ATR, 최대 {p.max_hold}일)")
-    stop = s.close - p.sl_atr * r.atr
-    if s.score < p.buy_th:
-        print(f"  점수 {s.score:+.0f} < 기준 {p.buy_th:g}: 신규 매수 안 함. "
-              f"보유 중이라면 손절 기준 {fmt(stop)}원 ({(stop / s.close - 1) * 100:+.1f}%)")
-    elif not mkt_ok:
-        print(f"  점수는 매수 기준 이상이지만 시장 필터({mkt_msg})로 신규 매수 보류")
+    print(f" [매매 가이드] 저장된 설정: {p.describe()}")
+    buy, _, why = backtest.latest(d, p)
+    for w in why:
+        print("  " + w)
+    stop = s.close - backtest.stop_distance(p, s.close, r.atr)
+    if not buy:
+        print(f"  → 매수 신호 없음. 보유 중이라면 손절 기준 {fmt(stop)}원 "
+              f"({(stop / s.close - 1) * 100:+.1f}%)")
+    elif p.market_filter and not mkt_ok:
+        print(f"  → 매수 신호지만 시장 필터({mkt_msg})로 신규 매수 보류")
     else:
-        print(f"  진입 참고가 : {fmt(s.close)}원 (다음날 시가 부근)")
+        print(f"  → 매수 신호! 진입 참고가 {fmt(s.close)}원 (다음날 시가 부근)")
         _plan(s.close, r.atr, p)
     print(" [최근 5일 점수 추이]")
     print("  " + "  ".join(f"{k.strftime('%m/%d')}:{v:+.0f}"
@@ -116,7 +118,8 @@ def cmd_analyze(a):
 
 
 def _plan(close: float, atr: float, p):
-    stop, t1, t2 = close - p.sl_atr * atr, close + p.tp_atr * atr, close + p.tp2_atr * atr
+    stop = close - backtest.stop_distance(p, close, atr)
+    t1, t2 = close + p.tp_atr * atr, close + p.tp2_atr * atr
     pct = lambda v: f"{(v / close - 1) * 100:+.1f}%"  # noqa: E731
     print(f"  손절가      : {fmt(stop)}원 ({pct(stop)})")
     if p.split:
@@ -125,11 +128,14 @@ def _plan(close: float, atr: float, p):
         print(f"  2차 익절    : {fmt(t2)}원 ({pct(t2)}) → 나머지 매도")
     else:
         print(f"  익절가      : {fmt(t1)}원 ({pct(t1)})")
-    print(f"  그 외 청산  : 점수 ≤ {p.exit_th:g} 또는 {p.max_hold}일 경과 시 다음날 시가")
+    cond = (f"RSI ≥ {p.rsi_exit:g}" if p.strategy == "pullback" else f"점수 ≤ {p.exit_th:g}")
+    print(f"  그 외 청산  : {cond} 또는 {p.max_hold}일 경과 시 다음날 시가")
 
 
 def cmd_scan(a):
     codes = read_codes(a.watchlist)
+    p = backtest.Params.load()
+    print(f"저장된 설정: {p.describe()}")
     rows = []
     for code in codes:
         try:
@@ -137,7 +143,9 @@ def cmd_scan(a):
             d = indicators.add_all(raw)
             s = score_at(d)
             r = d.iloc[-1]
+            buy, sell, _ = backtest.latest(d, p)
             rows.append(dict(코드=code, 종목=name, 종가=fmt(s.close),
+                             신호="매수" if buy else ("청산" if sell else "-"),
                              등락=f"{r.ret1 * 100:+.1f}%", 점수=s.score, 의견=s.opinion,
                              추세=s.parts["추세"], 모멘텀=s.parts["모멘텀"],
                              거래량=s.parts["거래량"], 수급=s.parts["수급"],
@@ -179,13 +187,12 @@ def cmd_backtest(a):
         p.market_filter = False
     if a.no_split:
         p.split = False
+    if a.strategy:
+        p.strategy = a.strategy
     codes = read_codes(a.codes)
-    mk = market_flags(codes, a.days)
-    trades = []
-    for code in codes:
-        raw, name = load(code, a.days, cache_hours=12)
-        trades += backtest.simulate(backtest.prepare(raw, mk), p, code)
-    print(f"백테스트 {len(codes)}종목 | 설정 {p}")
+    datasets = prepare_all(codes, a.days, verbose=False)
+    trades = [x for c, d in datasets.items() for x in backtest.simulate(d, p, c)]
+    print(f"백테스트 {len(datasets)}종목 | {p.describe()}")
     t = pd.DataFrame(trades)
     if not t.empty and a.show:
         with pd.option_context("display.width", 200):
@@ -193,57 +200,95 @@ def cmd_backtest(a):
     print("  " + _stat_line(backtest.summarize(t)))
 
 
-def cmd_optimize(a):
-    codes = read_codes(a.codes)
-    mk = market_flags(codes, a.days)
-    if mk is not None:
-        print(f"  시장 필터: 기간 중 {(~mk.mkt_ok).mean() * 100:.0f}%의 날이 신규 매수 금지")
+def prepare_all(codes: list[str], days: int, verbose: bool = True):
+    """여러 종목 데이터 + 지표 + 점수 + 시장필터 준비 (캐시 24시간)."""
+    mk = market_flags(codes, days)
+    if mk is not None and verbose:
+        print(f"  시장 필터: 기간 중 {(~mk.mkt_ok).mean() * 100:.0f}%의 날이 코스피 약세")
     datasets = {}
     for n, code in enumerate(codes, 1):
         try:
-            raw, name = load(code, a.days, cache_hours=12)
+            raw, name = load(code, days, cache_hours=24)
             datasets[code] = backtest.prepare(raw, mk)
-            print(f"  [{n}/{len(codes)}] {name}({code}) {len(raw)}일 준비 완료")
+            if verbose:
+                print(f"  [{n}/{len(codes)}] {name}({code}) {len(raw)}일 준비 완료")
         except Exception as e:  # noqa: BLE001
             print(f"  [{n}/{len(codes)}] {code} 실패: {e}")
+    return datasets
+
+
+STRATEGY_NAMES = {"score": "점수 전략 (기존)", "pullback": "눌림목 전략 (신규)"}
+
+
+def _row(label: str, tr: dict, te: dict) -> str:
+    return (f"  {label:<14} 학습 {tr['win']:5.1f}% ({tr['n']:>4}회, 평균 {tr['avg']:+.2f}%)"
+            f" | 검증 {te['win']:5.1f}% ({te['n']:>4}회, 평균 {te['avg']:+.2f}%, 최악 {te['worst']:+.1f}%)")
+
+
+def cmd_optimize(a):
+    codes = read_codes(a.codes)
+    datasets = prepare_all(codes, a.days)
     if not datasets:
         return
-    best, rows, cut = backtest.optimize(datasets, target_win=a.target, min_train=a.min_train)
-    print(f"\n조합 {len(rows)}개 시험 | 학습: ~{cut.date()} 이전 / 검증: {cut.date()} 이후")
-    top = sorted(rows, key=lambda r: (r["train"]["win"] if r["train"]["n"] >= a.min_train
-                                      and r["train"]["avg"] > 0 else -1), reverse=True)[:8]
-    print("\n[참고] 학습 구간 승률 상위 조합 (기대값 > 0 만)")
-    for r in top:
-        p = r["params"]
-        print(f"  매수≥{p.buy_th:<3} 익절 {p.tp_atr}/{p.tp2_atr}ATR 손절 {p.sl_atr}ATR "
-              f"보유 {p.max_hold:>2}일"
-              f" | 학습 {r['train']['win']:5.1f}% ({r['train']['n']}회, 평균 {r['train']['avg']:+.2f}%)"
-              f" | 검증 {r['test']['win']:5.1f}% ({r['test']['n']}회, 평균 {r['test']['avg']:+.2f}%)")
-    if best is None:
-        print("\n❌ 기대수익이 플러스인 조합이 없습니다. 종목/기간을 늘리거나 점수 로직을 수정하세요.")
+    strategies = ["score", "pullback"] if a.strategy == "both" else [a.strategy]
+    results, cut = {}, None
+    for st in strategies:
+        print(f"\n{'=' * 78}\n {STRATEGY_NAMES[st]}\n{'=' * 78}")
+        best, rows, cut = backtest.optimize(datasets, target_win=a.target, min_train=a.min_train,
+                                            base=backtest.Params(strategy=st))
+        print(f"  조합 {len(rows)}개 시험 | 학습: ~{cut.date()} 이전 / 검증: {cut.date()} 이후")
+        ok = [r for r in rows if r["train"]["n"] >= a.min_train and r["train"]["avg"] > 0
+              and r["train"]["pf"] > 1]
+        print(f"  학습 구간 조건(거래 ≥ {a.min_train}회, 평균수익 > 0, PF > 1) 통과: {len(ok)}개")
+        if ok:
+            print("\n  [참고] 학습 구간 평균수익 상위 5개")
+            for r in sorted(ok, key=lambda r: r["train"]["avg"], reverse=True)[:5]:
+                print(f"   · {r['params'].describe()}")
+                print("   " + _row("", r["train"], r["test"]).strip())
+        if best is None:
+            print("\n  ❌ 학습 구간에서 기대수익이 플러스인 조합이 없습니다.")
+            results[st] = None
+            continue
+        p, tr, te = best["params"], best["train"], best["test"]
+        print(f"\n  [선택된 설정] {p.describe()}")
+        print("   학습 " + _stat_line(tr))
+        print("   검증 " + _stat_line(te))
+        print("\n  [구성요소 효과] 같은 설정에서 하나씩 끄고 켠 결과")
+        for label, a_tr, a_te in backtest.ablation(datasets, p, cut):
+            print(_row(label, a_tr, a_te))
+        q = backtest.Params(**{**p.__dict__, "max_loss": 0})
+        print(_row("손실상한 없음", *backtest.evaluate(datasets, q, cut)))
+        results[st] = best
+
+    valid = {k: v for k, v in results.items() if v}
+    print(f"\n{'=' * 78}\n [최종 비교]\n{'=' * 78}")
+    for st, r in results.items():
+        if r:
+            print(_row(STRATEGY_NAMES[st][:6], r["train"], r["test"]))
+        else:
+            print(f"  {STRATEGY_NAMES[st][:6]:<14} 쓸 만한 설정 없음")
+    if not valid:
+        print("\n❌ 두 전략 모두 기대수익이 플러스인 설정이 없습니다. 실전 사용 불가.")
         return
-    p, tr, te = best["params"], best["train"], best["test"]
-    print("\n[선택된 설정]", p)
-    print("  학습 " + _stat_line(tr))
-    print("  검증 " + _stat_line(te))
+    # 전략 선택도 '학습' 성적으로만 한다 (검증 성적으로 고르면 검증의 의미가 사라짐)
+    st = max(valid, key=lambda k: valid[k]["train"]["avg"])
+    p, tr, te = valid[st]["params"], valid[st]["train"], valid[st]["test"]
+    print(f"\n  선택: {STRATEGY_NAMES[st]} (학습 구간 평균수익 기준으로 선택)")
+    print(f"  설정: {p.describe()}")
     total = tr["n"] + te["n"]
-    ok_n = total >= 100
-    ok_win = te["win"] >= a.target and tr["win"] >= a.target
-    print(f"\n  총 모의거래 {total}회 {'✅' if ok_n else '❌ (100회 미만: 종목이나 기간을 늘리세요)'}")
-    if ok_win:
-        print(f"  ✅ 학습·검증 모두 승률 {a.target:.0f}% 이상")
-    else:
-        print(f"  ⚠ 검증 승률 {te['win']:.1f}%: 목표 {a.target:.0f}% 미달. "
-              f"실전 기대치는 검증 숫자에 가깝습니다.")
-    if te["n"] and te["avg"] <= 0:
+    print(f"  총 모의거래 {total}회 {'✅' if total >= 100 else '❌ (100회 미만)'}")
+    if te["n"] == 0:
+        print("  ⚠ 검증 구간 거래 없음: 판단 불가")
+    elif te["avg"] <= 0:
         print("  ⚠ 검증 구간 평균수익이 마이너스: 실전 사용 비추천")
-    print("\n[B·C 효과 비교] 같은 설정에서 시장필터/분할익절을 켜고 끈 결과")
-    for label, a_tr, a_te in backtest.ablation(datasets, p, cut):
-        print(f"  {label:<12} 학습 {a_tr['win']:5.1f}% ({a_tr['n']}회, 평균 {a_tr['avg']:+.2f}%)"
-              f" | 검증 {a_te['win']:5.1f}% ({a_te['n']}회, 평균 {a_te['avg']:+.2f}%,"
-              f" 최악 {a_te['worst']:+.1f}%)")
+    elif te["win"] >= a.target:
+        print(f"  ✅ 검증 구간도 평균수익 플러스, 승률 {te['win']:.1f}% (목표 {a.target:.0f}% 이상)")
+    else:
+        print(f"  △ 검증 구간 평균수익은 플러스, 승률 {te['win']:.1f}% (목표 {a.target:.0f}% 미만)")
+    print(f"  ※ 시험한 조합이 많을수록 우연히 좋아 보일 위험이 큽니다. "
+          f"실전 전 모의매매(monitor/paper)로 꼭 재확인하세요.")
     p.save(extra={"train": tr, "test": te, "split_date": str(cut.date()), "codes": codes})
-    print(f"  설정 저장: {backtest.PARAMS_PATH} (monitor/backtest 가 자동 사용)")
+    print(f"  설정 저장: {backtest.PARAMS_PATH} (analyze/scan/monitor/backtest 가 자동 사용)")
 
 
 def cmd_monitor(a):
@@ -252,20 +297,13 @@ def cmd_monitor(a):
 
 def cmd_edge(a):
     import edge
-    codes = read_codes(a.codes)
-    mk = market_flags(codes, a.days)
-    datasets = {}
-    for code in codes:
-        try:
-            raw, _ = load(code, a.days, cache_hours=24)
-            datasets[code] = backtest.prepare(raw, mk)
-        except Exception as e:  # noqa: BLE001
-            print(f"  {code} 실패: {e}")
+    datasets = prepare_all(read_codes(a.codes), a.days, verbose=False)
     if not datasets:
         return
     cut = backtest.split_date(datasets, 0.7)
     print(f"신호 예측력 진단: {len(datasets)}종목 | 학습 ~{cut.date()} / 검증 {cut.date()}~")
     edge.report(datasets, cut, a.horizon)
+    edge.pullback_report(datasets, cut, a.horizon)
     p = backtest.Params.load()
     t = pd.DataFrame([x for c, d in datasets.items() for x in backtest.simulate(d, p, c)])
     if not t.empty:
@@ -337,6 +375,7 @@ def main(argv=None):
     s3.add_argument("--exit", dest="exit_th", type=float)
     s3.add_argument("--tp", dest="tp_atr", type=float, help="1차 익절 ATR 배수")
     s3.add_argument("--tp2", dest="tp2_atr", type=float, help="2차 익절 ATR 배수")
+    s3.add_argument("--strategy", choices=["score", "pullback"], help="전략 지정")
     s3.add_argument("--no-market", action="store_true", help="시장 필터(B) 끄기")
     s3.add_argument("--no-split", action="store_true", help="분할 익절(C) 끄기")
     s3.add_argument("--sl", dest="sl_atr", type=float, help="손절 ATR 배수")
@@ -344,7 +383,10 @@ def main(argv=None):
     s3.add_argument("--show", action="store_true", help="거래 내역 출력")
     s4 = sub.add_parser("optimize", help="과거 데이터로 승률 최적 설정 탐색")
     s4.add_argument("codes", nargs="?", default="universe.txt")
-    s4.add_argument("--target", type=float, default=80, help="목표 승률 %% (기본 80)")
+    s4.add_argument("--strategy", choices=["both", "score", "pullback"], default="both",
+                    help="시험할 전략 (기본 both: 둘 다 시험 후 비교)")
+    s4.add_argument("--target", type=float, default=60,
+                    help="목표 승률 %% (기본 60). 이 이상 중 평균수익 최대 설정 선택")
     s4.add_argument("--min-train", type=int, default=70, help="학습 구간 최소 거래수")
     s5 = sub.add_parser("monitor", help="장중 실시간 감시 + 모의매매 기록")
     s5.add_argument("codes", nargs="?", default="watchlist.txt")

@@ -64,3 +64,25 @@ def report(datasets: dict[str, pd.DataFrame], cut: pd.Timestamp, horizon: int = 
         print(f"  {label}: 정상 {_stats(s.fwd[s.mkt_ok.astype(bool)])} | "
               f"약세 {_stats(s.fwd[~s.mkt_ok.astype(bool)])}")
     return t
+
+
+def pullback_report(datasets: dict[str, pd.DataFrame], cut: pd.Timestamp, horizon: int = 5):
+    """눌림목 신호가 난 날 vs 모든 날의 이후 수익률 (조건별)."""
+    from backtest import Params, signals
+    t = forward_table(datasets, horizon)
+    print(f"\n[5] 눌림목 신호: 신호일 다음날 시가 매수 → {horizon}일 뒤 종가 (시장필터 없이)")
+    for label, lo, hi in (("학습", None, cut), ("검증", cut, None)):
+        base = t[(t.date >= lo if lo is not None else True) & (t.date < hi if hi is not None else True)]
+        print(f"  ── {label} ── 모든 날 기준: {_stats(base.fwd)}")
+        for ma in (60, 120):
+            for th in (30, 35, 40):
+                for confirm in (False, True):
+                    p = Params(strategy="pullback", trend_ma=ma, rsi_th=th, rsi_confirm=confirm,
+                               market_filter=False)
+                    sel = []
+                    for code, d in datasets.items():
+                        ent, _, _ = signals(d, p)
+                        sel.append(pd.DataFrame({"code": code, "date": d.index[ent].to_numpy()}))
+                    s = base.reset_index(drop=True).merge(pd.concat(sel), on=["code", "date"])
+                    print(f"    {ma:>3}일선 위·RSI≤{th}{'·반등' if confirm else '     '}: "
+                          f"{_stats(s.fwd)}")

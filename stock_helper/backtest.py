@@ -1,11 +1,16 @@
-"""점수 전략 백테스트 + 파라미터 최적화.
+"""전략 백테스트 + 파라미터 최적화.
+
+전략 (Params.strategy)
+  - score   : 종합점수 >= buy_th 이면 매수, 점수 <= exit_th 이면 청산
+  - pullback: 눌림목. 장기 상승 추세(종가 > trend_ma일선)인데 RSI <= rsi_th 로 과매도,
+              (rsi_confirm 이면 RSI가 전일보다 반등) 이면 매수, RSI >= rsi_exit 이면 청산
 
 매매 규칙 (실시간 모의매매와 동일)
-  - 진입: 장 마감 점수 >= buy_th 이고 시장 필터 통과(B) -> 다음날 시가 매수
-  - 손절: 진입가 - sl_atr * ATR  (장중 터치, 갭하락이면 시가)
+  - 진입: 장 마감 기준 매수 신호 + 시장 필터 통과(B, 사용 시) -> 다음날 시가 매수
+  - 손절: 진입가 - min(sl_atr * ATR, max_loss * 진입가)  (장중 터치, 갭하락이면 시가)
   - 1차 익절(C): 진입가 + tp_atr * ATR 터치 -> 절반 매도, 남은 절반 손절가를 '본전'으로 상향
   - 2차 익절: 진입가 + tp2_atr * ATR 터치 -> 나머지 매도
-  - 청산: 장 마감 점수 <= exit_th 또는 보유일 >= max_hold -> 다음날 시가 매도
+  - 청산: 장 마감 청산 신호 또는 보유일 >= max_hold -> 다음날 시가 매도
   - 비용: 왕복 cost (수수료 + 증권거래세, 기본 0.25%). 본전 = 진입가 x (1 + cost)
   같은 날 손절과 1차 익절가에 모두 닿으면 보수적으로 '손절' 처리.
   1차 익절 당일의 본전 이탈은 봉 모양으로 판단
@@ -44,6 +49,12 @@ class Params:
     cost: float = 0.0025
     split: bool = True            # C: 분할 익절 + 본전 스탑
     market_filter: bool = True    # B: 시장 필터
+    max_loss: float = 0.07        # 한 거래 최대 손실(손절폭 상한). 0 이면 제한 없음
+    strategy: str = "score"       # "score" | "pullback"
+    trend_ma: int = 120           # pullback: 장기 추세 기준 이동평균
+    rsi_th: float = 35            # pullback: 과매도 기준
+    rsi_confirm: bool = True      # pullback: RSI 반등 확인 후 매수
+    rsi_exit: float = 60          # pullback: RSI 회복 시 청산
 
     def save(self, path: str = PARAMS_PATH, extra: dict | None = None):
         with open(path, "w", encoding="utf-8") as f:
@@ -57,7 +68,45 @@ class Params:
             raw = json.load(f)
         fields = asdict(cls())
         return cls(**{k: type(fields[k])(raw[k]) for k in fields
-                      if k in raw and isinstance(raw[k], (int, float, bool))})
+                      if k in raw and isinstance(raw[k], (int, float, bool, str))})
+
+    def describe(self) -> str:
+        if self.strategy == "pullback":
+            core = (f"눌림목: {self.trend_ma}일선 위 + RSI ≤ {self.rsi_th:g}"
+                    f"{' + RSI 반등' if self.rsi_confirm else ''} → 매수, RSI ≥ {self.rsi_exit:g} 청산")
+        else:
+            core = f"점수: ≥ {self.buy_th:g} 매수, ≤ {self.exit_th:g} 청산"
+        tp = (f"1차 {self.tp_atr:g}ATR 절반·2차 {self.tp2_atr:g}ATR" if self.split
+              else f"익절 {self.tp_atr:g}ATR")
+        cap = f", 최대 −{self.max_loss * 100:g}%" if self.max_loss > 0 else ""
+        return (f"{core} | 손절 {self.sl_atr:g}ATR{cap} | {tp} | 최대 {self.max_hold}일 | "
+                f"시장필터 {'ON' if self.market_filter else 'OFF'}")
+
+
+def stop_distance(p: Params, entry: float, atr: float) -> float:
+    """손절폭 = ATR 배수, 단 max_loss 비율을 넘지 않게."""
+    dist = p.sl_atr * atr
+    return min(dist, p.max_loss * entry) if p.max_loss > 0 else dist
+
+
+def signals(d: pd.DataFrame, p: Params, use_market: bool = True):
+    """(매수신호 bool 배열, 청산신호 bool 배열, 청산 사유 이름). 장 마감 기준."""
+    if p.strategy == "pullback":
+        rsi = d["rsi"]
+        entry = (d["close"] > d[f"ma{p.trend_ma}"]) & (rsi <= p.rsi_th)
+        if p.rsi_confirm:
+            entry &= rsi > rsi.shift()
+        exit_ = rsi >= p.rsi_exit
+        label = "RSI회복"
+    elif p.strategy == "score":
+        sc = d["score"]
+        entry, exit_, label = sc >= p.buy_th, sc <= p.exit_th, "점수하락"
+    else:
+        raise ValueError(f"알 수 없는 전략: {p.strategy}")
+    entry &= d["atr"].notna()
+    if use_market and p.market_filter and "mkt_ok" in d:
+        entry &= d["mkt_ok"].astype(bool)
+    return entry.fillna(False).to_numpy(bool), exit_.fillna(False).to_numpy(bool), label
 
 
 def prepare(raw: pd.DataFrame, mk: pd.DataFrame | None = None, start: int = 60) -> pd.DataFrame:
@@ -79,12 +128,13 @@ def prepare(raw: pd.DataFrame, mk: pd.DataFrame | None = None, start: int = 60) 
 
 def simulate(d: pd.DataFrame, p: Params, code: str = "") -> list[dict]:
     o, h, l, c = (d[k].to_numpy() for k in ("open", "high", "low", "close"))
-    atr, sc, idx = d["atr"].to_numpy(), d["score"].to_numpy(), d.index
+    atr, idx = d["atr"].to_numpy(), d.index
+    sc = d["score"].to_numpy() if "score" in d else np.full(len(d), np.nan)
+    ent, exs, exit_label = signals(d, p)
     n = len(d)
-    mk = d["mkt_ok"].to_numpy(bool) if p.market_filter and "mkt_ok" in d else np.ones(n, bool)
     i, trades = 0, []
     while i < n - 1:
-        if not (sc[i] >= p.buy_th) or np.isnan(atr[i]) or not mk[i]:
+        if not ent[i]:
             i += 1
             continue
         j = i + 1                      # 진입일
@@ -92,7 +142,8 @@ def simulate(d: pd.DataFrame, p: Params, code: str = "") -> list[dict]:
         if not entry > 0:              # 데이터 이상(시가 0) -> 건너뜀
             i += 1
             continue
-        stop, t1, t2 = entry - p.sl_atr * a, entry + p.tp_atr * a, entry + p.tp2_atr * a
+        stop = entry - stop_distance(p, entry, a)
+        t1, t2 = entry + p.tp_atr * a, entry + p.tp2_atr * a
         be = entry * (1 + p.cost)      # 본전 스탑
         half = None                    # 1차 익절한 절반의 수익률
         exit_px = why = None
@@ -116,10 +167,10 @@ def simulate(d: pd.DataFrame, p: Params, code: str = "") -> list[dict]:
                     exit_px, why, ex = min(o[k], stop), "1차익절+본전", k
                 elif h[k] >= t2:
                     exit_px, why, ex = max(o[k], t2), "2차익절", k
-            if exit_px is None and (sc[k] <= p.exit_th or k - j + 1 >= p.max_hold) and k + 1 < n:
+            if exit_px is None and (exs[k] or k - j + 1 >= p.max_hold) and k + 1 < n:
                 exit_px, ex = o[k + 1], k + 1
                 why = ("1차익절+" if half is not None else "") + \
-                      ("점수하락" if sc[k] <= p.exit_th else "기간만료")
+                      (exit_label if exs[k] else "기간만료")
             if exit_px is not None:
                 break
             k += 1
@@ -152,8 +203,16 @@ def summarize(trades: list[dict] | pd.DataFrame) -> dict:
                 worst=float(r.min()), max_losing=mx)
 
 
-GRID = dict(buy_th=[25, 35, 45, 55], tp_atr=[0.5, 1.0, 1.5, 2.0],
-            tp2_atr=[2.0, 3.0, 4.0], sl_atr=[1.0, 1.5, 2.0, 3.0], max_hold=[3, 5, 10])
+GRIDS = {
+    "score": dict(buy_th=[25, 35, 45, 55], tp_atr=[0.5, 1.0, 1.5, 2.0],
+                  tp2_atr=[2.0, 3.0, 4.0], sl_atr=[1.0, 1.5, 2.0, 3.0], max_hold=[3, 5, 10],
+                  max_loss=[0.05, 0.07]),
+    "pullback": dict(trend_ma=[60, 120], rsi_th=[30.0, 35.0, 40.0], rsi_confirm=[False, True],
+                     rsi_exit=[50.0, 60.0], tp_atr=[1.0, 1.5, 2.0], tp2_atr=[3.0, 4.0],
+                     sl_atr=[1.5, 2.5], max_loss=[0.05, 0.07], max_hold=[5, 10],
+                     market_filter=[False, True]),
+}
+GRID = GRIDS["score"]
 
 
 def split_date(datasets: dict[str, pd.DataFrame], ratio: float) -> pd.Timestamp:
@@ -178,11 +237,13 @@ def ablation(datasets: dict[str, pd.DataFrame], p: Params, cut: pd.Timestamp) ->
     return out
 
 
-def optimize(datasets: dict[str, pd.DataFrame], target_win: float = 80, ratio: float = 0.7,
+def optimize(datasets: dict[str, pd.DataFrame], target_win: float = 60, ratio: float = 0.7,
              min_train: int = 50, grid: dict | None = None, base: Params | None = None):
-    """학습 구간에서 '기대값(평균수익) > 0, PF > 1' 조합 중
-       승률 target_win 이상이면 그 중 평균수익 최대, 없으면 승률 최대를 선택."""
-    grid, base = grid or GRID, base or Params()
+    """학습 구간에서 '거래 >= min_train, 평균수익 > 0, PF > 1' 조합 중
+       승률 target_win 이상이면 그 중 평균수익 최대, 없으면 전체 후보 중 평균수익 최대.
+       (승률만 최대화하면 '익절 짧게·손절 넓게'인 손실 큰 설정이 골라지므로 기대수익 기준)"""
+    base = base or Params()
+    grid = grid or GRIDS[base.strategy]
     cut = split_date(datasets, ratio)
     rows = []
     for combo in itertools.product(*grid.values()):
@@ -197,7 +258,32 @@ def optimize(datasets: dict[str, pd.DataFrame], target_win: float = 80, ratio: f
     if hit:
         best = max(hit, key=lambda r: r["train"]["avg"])
     elif ok:
-        best = max(ok, key=lambda r: (r["train"]["win"], r["train"]["avg"]))
+        best = max(ok, key=lambda r: r["train"]["avg"])
     else:
         best = None
     return best, rows, cut
+
+
+def latest(d: pd.DataFrame, p: Params, i: int = -1) -> tuple[bool, bool, list[str]]:
+    """i번째 날(기본 마지막) 장 마감 기준 (매수신호, 청산신호, 판단 근거). 시장필터 제외."""
+    d = d.copy()
+    if p.strategy == "score" and "score" not in d:
+        d["score"] = np.nan
+        for k in (len(d) + i - 1, len(d) + i):
+            d.iloc[k, d.columns.get_loc("score")] = score_at(d, k).score
+    ent, exs, _ = signals(d, p, use_market=False)
+    r, prev = d.iloc[i], d.iloc[i - 1]
+    if p.strategy == "pullback":
+        ma = r[f"ma{p.trend_ma}"]
+        why = [f"{'✅' if r.close > ma else '❌'} {p.trend_ma}일선 위 (종가 {r.close:,.0f} / "
+               f"{p.trend_ma}일선 {ma:,.0f})",
+               f"{'✅' if r.rsi <= p.rsi_th else '❌'} RSI {r.rsi:.1f} ≤ {p.rsi_th:g} (과매도)"]
+        if p.rsi_confirm:
+            why.append(f"{'✅' if r.rsi > prev.rsi else '❌'} RSI 반등 ({prev.rsi:.1f} → {r.rsi:.1f})")
+        if exs[i]:
+            why.append(f"⛔ RSI {r.rsi:.1f} ≥ {p.rsi_exit:g}: 보유 중이면 청산 신호")
+    else:
+        why = [f"{'✅' if ent[i] else '❌'} 종합점수 {r.score:+.1f} ≥ {p.buy_th:g}"]
+        if exs[i]:
+            why.append(f"⛔ 점수 {r.score:+.1f} ≤ {p.exit_th:g}: 보유 중이면 청산 신호")
+    return bool(ent[i]), bool(exs[i]), why

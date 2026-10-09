@@ -23,7 +23,7 @@ import pandas as pd
 import data
 import indicators
 import market
-from backtest import Params, summarize
+from backtest import Params, latest, stop_distance, summarize
 from signals import score_at
 
 KST = ZoneInfo("Asia/Seoul")
@@ -102,9 +102,10 @@ def step(codes: list[str], p: Params, loader, t: datetime, ledger: pd.DataFrame,
             elif half is not None and price >= t2:
                 why = "2차익절"
             if not why and pd.Timestamp(pos.entry_date).date() < t.date():
-                prev_score = score_at(d, -2).score if d.index[-1].date() == t.date() else s.score
-                if prev_score <= p.exit_th:
-                    why = "점수하락"
+                # 청산 신호는 '장 마감' 기준: 오늘 봉이 진행 중이면 어제 봉으로 판단
+                last_closed = -2 if d.index[-1].date() == t.date() else -1
+                if latest(d, p, last_closed)[1]:
+                    why = "RSI회복" if p.strategy == "pullback" else "점수하락"
                 elif _held_days(pos.entry_date, t) > p.max_hold:
                     why = "기간만료"
                 if why and half is not None:
@@ -115,12 +116,12 @@ def step(codes: list[str], p: Params, loader, t: datetime, ledger: pd.DataFrame,
                 ledger.loc[k, ["status", "exit_date", "exit", "ret", "reason"]] = \
                     ["closed", stamp, price, round(ret, 2), why]
                 log(f"  🔔 [모의 청산] {name}({code}) {price:,.0f}원 {why} → 총 {ret:+.2f}%")
-        elif s.score >= p.buy_th:                           # ---- 신규 진입
+        elif latest(d, p)[0]:                               # ---- 신규 진입
             if not mkt_ok:
                 log(f"  ✋ [매수 보류] {name}({code}) 점수 {s.score:+.0f} — 시장 필터")
             elif t.time() >= ENTRY_T and market_open(t):
                 new = dict(code=code, name=name, entry_date=stamp, entry=price,
-                           stop=round(price - p.sl_atr * atr),
+                           stop=round(price - stop_distance(p, price, atr)),
                            target=round(price + p.tp_atr * atr),
                            target2=round(price + p.tp2_atr * atr) if p.split else np.nan,
                            half_ret=np.nan, score=s.score, status="open", exit_date="",
@@ -163,7 +164,7 @@ def monitor(codes: list[str], p: Params, interval_min: float = 5, once: bool = F
         except Exception as e:  # noqa: BLE001
             return True, f"지수 조회 실패({e}) -> 필터 미적용"
 
-    print(f"감시 시작: {len(codes)}종목, {interval_min}분 간격, 설정 {p}")
+    print(f"감시 시작: {len(codes)}종목, {interval_min}분 간격\n설정: {p.describe()}")
     while True:
         t = now()
         if not once and not market_open(t):

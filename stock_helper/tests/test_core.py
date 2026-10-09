@@ -67,7 +67,7 @@ def _bars(highs, lows, opens=None, closes=None, score0=50):
 
 
 def test_simulate_stop_and_target_no_split():
-    p = backtest.Params(tp_atr=2, sl_atr=2, cost=0, split=False)
+    p = backtest.Params(tp_atr=2, sl_atr=2, cost=0, split=False, max_loss=0)
     t = backtest.simulate(_bars([101, 101, 111, 101, 101], [99] * 5), p, "X")
     assert t[0]["reason"] == "익절" and t[0]["exit"] == 110
     t = backtest.simulate(_bars([101] * 5, [99, 85, 99, 99, 99]), p, "X")
@@ -180,3 +180,29 @@ def test_clean_ohlcv_zero_open():
     c = data.clean_ohlcv(df)
     assert (c.iloc[0][["open", "high", "low"]] == 101).all()
     assert c.iloc[1].open == 100
+
+
+def test_max_loss_caps_stop():
+    # ATR 5, 손절 2ATR = -10% 이지만 최대손실 5% 로 제한 -> 95 에서 손절
+    p = backtest.Params(tp_atr=2, sl_atr=2, cost=0, split=False, max_loss=0.05)
+    t = backtest.simulate(_bars([101] * 5, [99, 85, 99, 99, 99]), p, "X")
+    assert t[0]["reason"] == "손절" and t[0]["exit"] == 95
+
+
+def test_pullback_signal():
+    n = 130
+    idx = pd.bdate_range("2026-01-01", periods=n)
+    d = pd.DataFrame({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+                      "atr": 2.0, "ma120": 90.0, "ma60": 95.0, "rsi": 50.0,
+                      "mkt_ok": True}, index=idx)
+    d.loc[idx[-3], "rsi"] = 30.0   # 과매도
+    d.loc[idx[-2], "rsi"] = 33.0   # 반등
+    p = backtest.Params(strategy="pullback", trend_ma=120, rsi_th=35, rsi_confirm=True)
+    ent, exs, label = backtest.signals(d, p)
+    assert not ent[-3] and ent[-2] and not ent[-1]   # 반등 확인된 날만
+    p.rsi_confirm = False
+    ent, _, _ = backtest.signals(d, p)
+    assert ent[-3] and ent[-2]
+    d["ma120"] = 110.0                                # 장기 추세 아래면 매수 안 함
+    assert not backtest.signals(d, p)[0].any()
+    assert label == "RSI회복" and not exs[0]          # RSI 50 < 청산선 60
