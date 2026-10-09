@@ -29,6 +29,7 @@ import indicators
 import market
 from signals import score_at
 
+PARTS = ("추세", "모멘텀", "거래량", "수급")
 PARAMS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_params.json")
 
 
@@ -64,9 +65,15 @@ def prepare(raw: pd.DataFrame, mk: pd.DataFrame | None = None, start: int = 60) 
     mk: market.flags() 결과. None 이면 시장 필터 없이 항상 허용."""
     d = market.attach(indicators.add_all(raw), mk)
     sc = np.full(len(d), np.nan)
+    parts = {k: np.full(len(d), np.nan) for k in PARTS}
     for i in range(start, len(d)):
-        sc[i] = score_at(d, i).score
+        sig = score_at(d, i)
+        sc[i] = sig.score
+        for k in PARTS:
+            parts[k][i] = sig.parts[k]
     d["score"] = sc
+    for k in PARTS:
+        d[f"part_{k}"] = parts[k]
     return d
 
 

@@ -250,6 +250,32 @@ def cmd_monitor(a):
     realtime.monitor(read_codes(a.codes), backtest.Params.load(), a.interval, a.once, a.days)
 
 
+def cmd_edge(a):
+    import edge
+    codes = read_codes(a.codes)
+    mk = market_flags(codes, a.days)
+    datasets = {}
+    for code in codes:
+        try:
+            raw, _ = load(code, a.days, cache_hours=24)
+            datasets[code] = backtest.prepare(raw, mk)
+        except Exception as e:  # noqa: BLE001
+            print(f"  {code} 실패: {e}")
+    if not datasets:
+        return
+    cut = backtest.split_date(datasets, 0.7)
+    print(f"신호 예측력 진단: {len(datasets)}종목 | 학습 ~{cut.date()} / 검증 {cut.date()}~")
+    edge.report(datasets, cut, a.horizon)
+    p = backtest.Params.load()
+    t = pd.DataFrame([x for c, d in datasets.items() for x in backtest.simulate(d, p, c)])
+    if not t.empty:
+        print(f"\n[4] 저장된 설정의 최악 거래 5건 (데이터 오류인지 실제 급락인지 확인용)")
+        w = t.nsmallest(5, "ret")
+        for r in w.itertuples():
+            print(f"  {r.code} {r.entry_date.date()} 매수 {r.entry:,.0f} → {r.exit_date.date()} "
+                  f"{r.exit:,.0f} ({r.ret:+.1f}%, {r.reason}, {r.held}일)")
+
+
 def cmd_paper(a):
     realtime.paper_report(a.target_n)
 
@@ -324,11 +350,15 @@ def main(argv=None):
     s5.add_argument("codes", nargs="?", default="watchlist.txt")
     s5.add_argument("--interval", type=float, default=5, help="점검 간격(분)")
     s5.add_argument("--once", action="store_true", help="1회만 점검 (장외 시간에도)")
+    s7 = sub.add_parser("edge", help="신호 예측력 진단 (점수/영역별 이후 수익률)")
+    s7.add_argument("codes", nargs="?", default="universe.txt")
+    s7.add_argument("--horizon", type=int, default=5, help="보유 가정 일수 (기본 5)")
     s6 = sub.add_parser("paper", help="모의매매 성적 집계")
     s6.add_argument("--target-n", type=int, default=100)
     a = p.parse_args(argv)
     {"analyze": cmd_analyze, "scan": cmd_scan, "backtest": cmd_backtest,
-     "optimize": cmd_optimize, "monitor": cmd_monitor, "paper": cmd_paper}[a.cmd](a)
+     "optimize": cmd_optimize, "monitor": cmd_monitor, "paper": cmd_paper,
+     "edge": cmd_edge}[a.cmd](a)
 
 
 if __name__ == "__main__":
