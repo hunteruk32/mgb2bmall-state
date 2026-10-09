@@ -3,3 +3,4 @@ numpy>=1.24
 requests>=2.28
 matplotlib>=3.7   # --chart 옵션용
 pykrx>=1.0        # 선택: 네이버 조회 실패 시 보조 소스
+tzdata             # Windows에서 한국 시간(Asia/Seoul) 계산용
