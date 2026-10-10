@@ -4,6 +4,8 @@
   - score   : 종합점수 >= buy_th 이면 매수, 점수 <= exit_th 이면 청산
   - pullback: 눌림목. 장기 상승 추세(종가 > trend_ma일선)인데 RSI <= rsi_th 로 과매도,
               (rsi_confirm 이면 RSI가 전일보다 반등) 이면 매수, RSI >= rsi_exit 이면 청산
+  - reversal: 단기 반등. 단기 급락(rev_signal: rsi / drop5 / ma20gap, 기준 rev_th) 시 매수,
+              RSI >= rsi_exit 이면 청산 (research 에서 매년 꾸준했던 신호)
 
 매매 규칙 (실시간 모의매매와 동일)
   - 진입: 장 마감 기준 매수 신호 + 시장 필터 통과(B, 사용 시) -> 다음날 시가 매수
@@ -54,7 +56,9 @@ class Params:
     trend_ma: int = 120           # pullback: 장기 추세 기준 이동평균
     rsi_th: float = 35            # pullback: 과매도 기준
     rsi_confirm: bool = True      # pullback: RSI 반등 확인 후 매수
-    rsi_exit: float = 60          # pullback: RSI 회복 시 청산
+    rsi_exit: float = 60          # pullback/reversal: RSI 회복 시 청산
+    rev_signal: str = "rsi"       # reversal: "rsi"(RSI ≤ th) | "drop5"(5일 −th% 이하) | "ma20gap"(20일선 −th% 이하)
+    rev_th: float = 30            # reversal: 기준값
 
     def save(self, path: str = PARAMS_PATH, extra: dict | None = None):
         with open(path, "w", encoding="utf-8") as f:
@@ -78,9 +82,15 @@ class Params:
             core = f"점수: ≥ {self.buy_th:g} 매수, ≤ {self.exit_th:g} 청산"
         tp = (f"1차 {self.tp_atr:g}ATR 절반·2차 {self.tp2_atr:g}ATR" if self.split
               else f"익절 {self.tp_atr:g}ATR")
+        if self.strategy == "reversal":
+            core = f"반등: {REV_LABEL[self.rev_signal].format(th=self.rev_th)} → 매수, RSI ≥ {self.rsi_exit:g} 청산"
         cap = f", 최대 −{self.max_loss * 100:g}%" if self.max_loss > 0 else ""
         return (f"{core} | 손절 {self.sl_atr:g}ATR{cap} | {tp} | 최대 {self.max_hold}일 | "
                 f"시장필터 {'ON' if self.market_filter else 'OFF'}")
+
+
+REV_LABEL = {"rsi": "RSI ≤ {th:g}", "drop5": "5일간 −{th:g}% 이상 급락",
+             "ma20gap": "20일선보다 −{th:g}% 이상 아래"}
 
 
 def stop_distance(p: Params, entry: float, atr: float) -> float:
@@ -97,6 +107,17 @@ def signals(d: pd.DataFrame, p: Params, use_market: bool = True):
         if p.rsi_confirm:
             entry &= rsi > rsi.shift()
         exit_ = rsi >= p.rsi_exit
+        label = "RSI회복"
+    elif p.strategy == "reversal":
+        if p.rev_signal == "rsi":
+            entry = d["rsi"] <= p.rev_th
+        elif p.rev_signal == "drop5":
+            entry = d["ret5"] <= -p.rev_th
+        elif p.rev_signal == "ma20gap":
+            entry = d["close"] / d["ma20"] <= 1 - p.rev_th / 100
+        else:
+            raise ValueError(f"알 수 없는 반등 신호: {p.rev_signal}")
+        exit_ = d["rsi"] >= p.rsi_exit
         label = "RSI회복"
     elif p.strategy == "always":  # 비교 기준선: 신호 없이 매일 매수 시도 (청산은 손익절/기간만)
         entry = pd.Series(True, index=d.index)
@@ -277,21 +298,41 @@ WF_GRIDS = {  # 기간별 반복 검증용 (조합 수를 줄여 과최적화·�
 }
 
 
+def reversal_combos() -> list[Params]:
+    out = []
+    for sig, th in (("rsi", 25), ("rsi", 30), ("drop5", 8), ("drop5", 12),
+                    ("ma20gap", 10), ("ma20gap", 15)):
+        for rx, hold, ml, sp in itertools.product([50.0, 60.0], [3, 5, 10], [0.07, 0.10],
+                                                  [False, True]):
+            out.append(Params(strategy="reversal", rev_signal=sig, rev_th=float(th),
+                              rsi_exit=rx, max_hold=hold, max_loss=ml, split=sp,
+                              tp_atr=2.0, tp2_atr=4.0, sl_atr=3.0, market_filter=False))
+    return out
+
+
+def combos_for(strategy: str, grid: dict | None = None) -> list[Params]:
+    if strategy == "reversal" and grid is None:
+        return reversal_combos()
+    grid = grid or WF_GRIDS[strategy]
+    out = []
+    for combo in itertools.product(*grid.values()):
+        p = Params(**{**asdict(Params(strategy=strategy)), **dict(zip(grid.keys(), combo))})
+        if not (p.split and p.tp2_atr <= p.tp_atr):
+            out.append(p)
+    return out
+
+
 def walk_forward(datasets: dict[str, pd.DataFrame], strategy: str, n_folds: int = 4,
                  warm: float = 0.25, target_win: float = 60, min_train: int = 50,
                  grid: dict | None = None):
     """기간을 n_folds 개 구간으로 나눠, 각 구간 직전까지의 데이터로만 설정을 고르고
        그 구간에서 성적을 잰다 (확장형 walk-forward). 반환: (구간별 결과, 전체 실전가정 성적, 최종설정)."""
-    grid = grid or WF_GRIDS[strategy]
     dates = sorted(set().union(*[set(d.index) for d in datasets.values()]))
     edges = np.linspace(int(len(dates) * warm), len(dates), n_folds + 1).astype(int)
     bounds = [(dates[edges[f]], dates[edges[f + 1]] if edges[f + 1] < len(dates) else None)
               for f in range(n_folds)]
     sims = []
-    for combo in itertools.product(*grid.values()):
-        p = Params(**{**asdict(Params(strategy=strategy)), **dict(zip(grid.keys(), combo))})
-        if p.split and p.tp2_atr <= p.tp_atr:
-            continue
+    for p in combos_for(strategy, grid):
         t = pd.DataFrame([x for code, d in datasets.items() for x in simulate(d, p, code)])
         sims.append((p, t))
     folds, oos, base_all = [], [], []
@@ -339,6 +380,12 @@ def latest(d: pd.DataFrame, p: Params, i: int = -1) -> tuple[bool, bool, list[st
                f"{'✅' if r.rsi <= p.rsi_th else '❌'} RSI {r.rsi:.1f} ≤ {p.rsi_th:g} (과매도)"]
         if p.rsi_confirm:
             why.append(f"{'✅' if r.rsi > prev.rsi else '❌'} RSI 반등 ({prev.rsi:.1f} → {r.rsi:.1f})")
+        if exs[i]:
+            why.append(f"⛔ RSI {r.rsi:.1f} ≥ {p.rsi_exit:g}: 보유 중이면 청산 신호")
+    elif p.strategy == "reversal":
+        cur = {"rsi": f"RSI {r.rsi:.1f}", "drop5": f"5일 수익률 {r.ret5:+.1f}%",
+               "ma20gap": f"20일선 대비 {(r.close / r.ma20 - 1) * 100:+.1f}%"}[p.rev_signal]
+        why = [f"{'✅' if ent[i] else '❌'} {REV_LABEL[p.rev_signal].format(th=p.rev_th)} (현재 {cur})"]
         if exs[i]:
             why.append(f"⛔ RSI {r.rsi:.1f} ≥ {p.rsi_exit:g}: 보유 중이면 청산 신호")
     else:

@@ -79,6 +79,7 @@ def add_all(df: pd.DataFrame) -> pd.DataFrame:
     d["vol_ratio"] = d["volume"] / d["volume"].rolling(20).mean()
     d["high20"] = d["high"].rolling(20).max()
     d["ret1"] = c.pct_change()
+    d["ret5"] = c.pct_change(5) * 100
 
     # ---- 수급 (단위: 주). 거래량 대비 비율로 정규화해 종목 간 비교 가능하게.
     for who in ("foreign", "inst"):

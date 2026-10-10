@@ -105,7 +105,7 @@ def step(codes: list[str], p: Params, loader, t: datetime, ledger: pd.DataFrame,
                 # 청산 신호는 '장 마감' 기준: 오늘 봉이 진행 중이면 어제 봉으로 판단
                 last_closed = -2 if d.index[-1].date() == t.date() else -1
                 if latest(d, p, last_closed)[1]:
-                    why = "RSI회복" if p.strategy == "pullback" else "점수하락"
+                    why = "점수하락" if p.strategy == "score" else "RSI회복"
                 elif _held_days(pos.entry_date, t) > p.max_hold:
                     why = "기간만료"
                 if why and half is not None:

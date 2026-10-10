@@ -128,7 +128,7 @@ def _plan(close: float, atr: float, p):
         print(f"  2차 익절    : {fmt(t2)}원 ({pct(t2)}) → 나머지 매도")
     else:
         print(f"  익절가      : {fmt(t1)}원 ({pct(t1)})")
-    cond = (f"RSI ≥ {p.rsi_exit:g}" if p.strategy == "pullback" else f"점수 ≤ {p.exit_th:g}")
+    cond = (f"점수 ≤ {p.exit_th:g}" if p.strategy == "score" else f"RSI ≥ {p.rsi_exit:g}")
     print(f"  그 외 청산  : {cond} 또는 {p.max_hold}일 경과 시 다음날 시가")
 
 
@@ -217,7 +217,7 @@ def prepare_all(codes: list[str], days: int, verbose: bool = True):
     return datasets
 
 
-STRATEGY_NAMES = {"score": "점수 전략 (기존)", "pullback": "눌림목 전략 (신규)"}
+STRATEGY_NAMES = {"score": "점수 전략", "pullback": "눌림목 전략", "reversal": "반등 전략 (신규)"}
 
 
 def _row(label: str, tr: dict, te: dict) -> str:
@@ -369,7 +369,7 @@ def cmd_walkforward(a):
     print(f"기간별 반복 검증: {len(datasets)}종목 × 약 {a.years}년, {a.folds}개 구간")
     print("  방식: 각 구간 '직전까지' 데이터로만 설정을 고르고, 그 구간에서 실제처럼 매매")
     _flow_coverage(datasets)
-    strategies = ["score", "pullback"] if a.strategy == "both" else [a.strategy]
+    strategies = ["score", "pullback", "reversal"] if a.strategy == "all" else [a.strategy]
     finals = {}
     for st in strategies:
         folds, oos, final, ncombo, base = backtest.walk_forward(
@@ -509,7 +509,8 @@ def main(argv=None):
         if name == "research":
             sp.add_argument("--horizon", type=int, default=5, help="보유 가정 일수 (기본 5)")
         else:
-            sp.add_argument("--strategy", choices=["both", "score", "pullback"], default="both")
+            sp.add_argument("--strategy", choices=["all", "score", "pullback", "reversal"],
+                            default="all")
             sp.add_argument("--folds", type=int, default=4, help="검증 구간 수 (기본 4)")
             sp.add_argument("--target", type=float, default=60)
             sp.add_argument("--min-train", type=int, default=50)

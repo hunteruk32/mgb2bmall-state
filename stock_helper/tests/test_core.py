@@ -239,3 +239,19 @@ def test_research_report_runs(capsys):
     ds = {f"D{i}": backtest.prepare(data.synthetic(300, seed=i)) for i in range(3)}
     r = research.report(ds, horizon=5, min_n=5)
     assert len(r) > 10 and "꾸준함" in capsys.readouterr().out
+
+
+def test_reversal_signals():
+    idx = pd.bdate_range("2026-01-01", periods=5)
+    d = pd.DataFrame({"close": [100.0, 100, 85, 88, 95], "ma20": [100.0] * 5,
+                      "rsi": [50.0, 45, 28, 35, 62], "ret5": [0.0, 0, -15, -12, -5],
+                      "atr": 2.0}, index=idx)
+    for sig, th, want in (("rsi", 30, [0, 0, 1, 0, 0]), ("drop5", 12, [0, 0, 1, 1, 0]),
+                          ("ma20gap", 10, [0, 0, 1, 1, 0])):
+        p = backtest.Params(strategy="reversal", rev_signal=sig, rev_th=th, rsi_exit=60,
+                            market_filter=False)
+        ent, exs, label = backtest.signals(d, p)
+        assert list(ent.astype(int)) == want, sig
+        assert exs[-1] and not exs[2] and label == "RSI회복"
+    assert len(backtest.reversal_combos()) == 144
+    assert "반등" in backtest.Params(strategy="reversal").describe()

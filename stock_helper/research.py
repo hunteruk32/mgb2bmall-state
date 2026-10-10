@@ -116,4 +116,7 @@ def report(datasets: dict[str, pd.DataFrame], horizon: int = 5, min_n: int = 30)
     print("  매년 시장보다 나았던 신호: " + (", ".join(good.signal) if len(good) else "없음"))
     print("  매년 시장보다 못했던 신호: " + (", ".join(bad.signal) if len(bad) else "없음")
           + "  (피해야 할 신호 후보)")
+    print("  ※ 주의: 종목 목록이 '현재' 시가총액 상위라서, 과거에 폭락 후 회복 못 한 종목은 빠져 있음"
+          "\n    (생존 편향). 특히 '급락 후 매수' 신호가 실제보다 좋게 나올 수 있음."
+          "\n  ※ 초과수익은 수수료·세금(왕복 약 0.25%) 차감 전 숫자.")
     return r
