@@ -314,6 +314,106 @@ def cmd_edge(a):
                   f"{r.exit:,.0f} ({r.ret:+.1f}%, {r.reason}, {r.held}일)")
 
 
+def default_universe() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    wide = os.path.join(here, "universe_wide.txt")
+    return wide if os.path.exists(wide) else os.path.join(here, "universe.txt")
+
+
+def cmd_universe(a):
+    rows = []
+    for market, n in (("KOSPI", a.kospi), ("KOSDAQ", a.kosdaq)):
+        if n <= 0:
+            continue
+        try:
+            got = data.fetch_universe(market, n)
+            print(f"  {market}: {len(got)}종목")
+            rows += [(c, nm, market) for c, nm in got]
+        except Exception as e:  # noqa: BLE001
+            print(f"  {market} 실패: {e}")
+    if not rows:
+        print("종목 목록을 받지 못했습니다. python diag.py 결과를 보내주세요.")
+        return
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), a.out)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# 시가총액 상위 보통주 (코스피 {a.kospi} / 코스닥 {a.kosdaq}), 자동 생성\n")
+        for c, nm, mk in rows:
+            f.write(f"{c}  # {nm} ({mk})\n")
+    print(f"저장: {path} ({len(rows)}종목)")
+
+
+def cmd_research(a):
+    import research
+    codes = read_codes(a.codes or default_universe())
+    days = a.years * 250
+    print(f"신호 연구: {len(codes)}종목 × 약 {a.years}년 (처음엔 데이터 수집에 시간이 걸립니다)")
+    datasets = prepare_all(codes, days, verbose=a.verbose)
+    print(f"  준비 완료: {len(datasets)}종목")
+    _flow_coverage(datasets)
+    research.report(datasets, a.horizon)
+
+
+def _flow_coverage(datasets):
+    starts = [d["foreign"].first_valid_index() for d in datasets.values()
+              if "foreign" in d and d["foreign"].notna().any()]
+    if starts:
+        s = pd.Series(pd.to_datetime(starts))
+        print(f"  수급 데이터 시작일: 중간값 {s.median().date()} (가장 이른 {s.min().date()}) / "
+              f"수급 있는 종목 {len(starts)}/{len(datasets)}")
+
+
+def cmd_walkforward(a):
+    codes = read_codes(a.codes or default_universe())
+    days = a.years * 250
+    datasets = prepare_all(codes, days, verbose=a.verbose)
+    print(f"기간별 반복 검증: {len(datasets)}종목 × 약 {a.years}년, {a.folds}개 구간")
+    print("  방식: 각 구간 '직전까지' 데이터로만 설정을 고르고, 그 구간에서 실제처럼 매매")
+    _flow_coverage(datasets)
+    strategies = ["score", "pullback"] if a.strategy == "both" else [a.strategy]
+    finals = {}
+    for st in strategies:
+        folds, oos, final, ncombo, base = backtest.walk_forward(
+            datasets, st, a.folds, target_win=a.target, min_train=a.min_train)
+        print(f"\n{'=' * 78}\n {STRATEGY_NAMES[st]}  (조합 {ncombo}개)\n{'=' * 78}")
+        for f in folds:
+            end = f["end"].date() if f["end"] is not None else "현재"
+            b = f["best"]
+            if b is None:
+                print(f"  {f['start'].date()} ~ {end}: 조건 맞는 설정 없음 → 매매 안 함")
+                continue
+            print(f"  {f['start'].date()} ~ {end}: {b['params'].describe()}")
+            print(f"     직전까지(학습) {_stat_line(b['train'])}")
+            print(f"     이 구간(실전)  {_stat_line(b['test'])}")
+            if f["base"]:
+                print(f"     비교: 아무날 매수 {_stat_line(f['base'])}")
+        print(f"\n  ▶ 실전 가정 전체 성적 (모든 구간 합산): {_stat_line(oos)}")
+        print(f"  ▷ 비교: 같은 규칙으로 아무 날이나 매수:  {_stat_line(base)}")
+        finals[st] = (final, oos, base)
+    print(f"\n{'=' * 78}\n [결론]\n{'=' * 78}")
+    print("  (판정: 평균수익 플러스·PF > 1.1 이면서 '아무 날이나 매수'보다 거래당 0.2%p 이상 나아야 ✅)")
+
+    def beats(oos, base):
+        return (oos["n"] >= 30 and oos["avg"] > 0 and oos["pf"] > 1.1
+                and oos["avg"] - base["avg"] >= 0.2)
+
+    for st, (final, oos, base) in finals.items():
+        edge_p = oos["avg"] - base["avg"] if oos["n"] and base["n"] else float("nan")
+        verdict = ("거래 없음" if not oos["n"] else
+                   "✅ 신호 효과 있음" if beats(oos, base) else
+                   "△ 수익은 났지만 아무날 매수와 비슷 (신호 효과 불확실)" if oos["avg"] > 0 else
+                   "❌ 마이너스")
+        print(f"  {STRATEGY_NAMES[st]:<16} 실전 가정 {oos['n']}회, 승률 {oos['win']:.1f}%, "
+              f"평균 {oos['avg']:+.2f}% (아무날 대비 {edge_p:+.2f}%p) → {verdict}")
+    good = {k: v for k, v in finals.items() if beats(v[1], v[2]) and v[0] is not None}
+    if not good:
+        print("\n  어느 전략도 '아무 날이나 매수'보다 확실히 낫지 않습니다. 설정을 저장하지 않습니다.")
+        return
+    st = max(good, key=lambda k: good[k][1]["avg"])
+    final = good[st][0]
+    print(f"\n  저장: {STRATEGY_NAMES[st]} — 전체 기간으로 다시 고른 설정 {final['params'].describe()}")
+    final["params"].save(extra={"walkforward_oos": good[st][1], "codes": codes})
+
+
 def cmd_paper(a):
     realtime.paper_report(a.target_n)
 
@@ -395,12 +495,31 @@ def main(argv=None):
     s7 = sub.add_parser("edge", help="신호 예측력 진단 (점수/영역별 이후 수익률)")
     s7.add_argument("codes", nargs="?", default="universe.txt")
     s7.add_argument("--horizon", type=int, default=5, help="보유 가정 일수 (기본 5)")
+    s8 = sub.add_parser("universe", help="시가총액 상위 종목 목록 생성 (universe_wide.txt)")
+    s8.add_argument("--kospi", type=int, default=100)
+    s8.add_argument("--kosdaq", type=int, default=50)
+    s8.add_argument("--out", default="universe_wide.txt")
+    for name, helptext in (("research", "신호별 연도별 초과수익 연구"),
+                           ("walkforward", "기간을 바꿔가며 반복 검증")):
+        sp = sub.add_parser(name, help=helptext)
+        sp.add_argument("codes", nargs="?", default=None,
+                        help="종목 파일 (기본: universe_wide.txt, 없으면 universe.txt)")
+        sp.add_argument("--years", type=int, default=5, help="기간(년), 기본 5")
+        sp.add_argument("--verbose", action="store_true", help="종목별 진행 표시")
+        if name == "research":
+            sp.add_argument("--horizon", type=int, default=5, help="보유 가정 일수 (기본 5)")
+        else:
+            sp.add_argument("--strategy", choices=["both", "score", "pullback"], default="both")
+            sp.add_argument("--folds", type=int, default=4, help="검증 구간 수 (기본 4)")
+            sp.add_argument("--target", type=float, default=60)
+            sp.add_argument("--min-train", type=int, default=50)
     s6 = sub.add_parser("paper", help="모의매매 성적 집계")
     s6.add_argument("--target-n", type=int, default=100)
     a = p.parse_args(argv)
     {"analyze": cmd_analyze, "scan": cmd_scan, "backtest": cmd_backtest,
      "optimize": cmd_optimize, "monitor": cmd_monitor, "paper": cmd_paper,
-     "edge": cmd_edge}[a.cmd](a)
+     "edge": cmd_edge, "universe": cmd_universe, "research": cmd_research,
+     "walkforward": cmd_walkforward}[a.cmd](a)
 
 
 if __name__ == "__main__":

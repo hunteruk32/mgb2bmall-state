@@ -319,3 +319,64 @@ def load_index(name: str = "KOSPI", count: int = 500, cache_hours: float = 0,
         os.makedirs(CACHE_DIR, exist_ok=True)
         df.to_csv(path)
     return df
+
+
+# ---------------------------------------------------------------- 종목 풀 (시가총액 상위)
+_EXCLUDE = ("스팩", "리츠", "KODEX", "TIGER", "KBSTAR", "ARIRANG", "HANARO", "KOSEF",
+            "ACE ", "SOL ", "RISE ", "PLUS ", "ETN", "인버스", "레버리지")
+
+
+def _keep(code: str, name: str) -> bool:
+    # 보통주(코드 끝자리 0)만, 스팩/리츠/ETF/ETN 제외
+    return bool(re.fullmatch(r"\d{5}0", code)) and not any(x in name for x in _EXCLUDE)
+
+
+def fetch_universe(market: str = "KOSPI", n: int = 100) -> list[tuple[str, str]]:
+    """시가총액 상위 n개 보통주 [(코드, 종목명)]. 네이버 모바일 → PC 순."""
+    out: list[tuple[str, str]] = []
+    try:
+        page = 1
+        while len(out) < n and page <= 10:
+            url = (f"https://m.stock.naver.com/api/stocks/marketValue/{market}"
+                   f"?page={page}&pageSize=100")
+            r = requests.get(url, headers=MOBILE_UA, timeout=TIMEOUT)
+            r.raise_for_status()
+            js = r.json()
+            rows = js if isinstance(js, list) else next(
+                (v for v in js.values() if isinstance(v, list)), [])
+            if not rows:
+                break
+            for row in rows:
+                kc = _find_key(row, "itemcode") or _find_key(row, "code")
+                kn = _find_key(row, "stockname") or _find_key(row, "name")
+                kt = _find_key(row, "endtype")
+                if not (kc and kn) or (kt and str(row[kt]).lower() != "stock"):
+                    continue
+                code, name = str(row[kc]), str(row[kn])
+                if _keep(code, name) and code not in {c for c, _ in out}:
+                    out.append((code, name))
+            page += 1
+            time.sleep(0.15)
+    except Exception:  # noqa: BLE001
+        out = []
+    if len(out) >= min(n, 20):
+        return out[:n]
+    # 보조: PC 시가총액 페이지 (페이지당 50종목)
+    out, sosok = [], 0 if market == "KOSPI" else 1
+    for page in range(1, 10):
+        url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
+        r = requests.get(url, headers=UA, timeout=TIMEOUT)
+        r.raise_for_status()
+        found = re.findall(r'/item/main\.naver\?code=(\d{6})"[^>]*>([^<]+)</a>', _decode(r))
+        if not found:
+            break
+        for code, name in found:
+            name = name.strip()
+            if _keep(code, name) and code not in {c for c, _ in out}:
+                out.append((code, name))
+        if len(out) >= n:
+            break
+        time.sleep(0.15)
+    if not out:
+        raise DataError(f"{market} 종목 목록 조회 실패")
+    return out[:n]

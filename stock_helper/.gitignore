@@ -4,3 +4,4 @@ __pycache__/
 cache/
 paper_trades.csv
 best_params.json
+universe_wide.txt

@@ -98,6 +98,10 @@ def signals(d: pd.DataFrame, p: Params, use_market: bool = True):
             entry &= rsi > rsi.shift()
         exit_ = rsi >= p.rsi_exit
         label = "RSI회복"
+    elif p.strategy == "always":  # 비교 기준선: 신호 없이 매일 매수 시도 (청산은 손익절/기간만)
+        entry = pd.Series(True, index=d.index)
+        exit_ = pd.Series(False, index=d.index)
+        label = "기간만료"
     elif p.strategy == "score":
         sc = d["score"]
         entry, exit_, label = sc >= p.buy_th, sc <= p.exit_th, "점수하락"
@@ -252,16 +256,71 @@ def optimize(datasets: dict[str, pd.DataFrame], target_win: float = 60, ratio: f
             continue
         tr, te = evaluate(datasets, p, cut)
         rows.append(dict(params=p, train=tr, test=te))
-    ok = [r for r in rows if r["train"]["n"] >= min_train and r["train"]["avg"] > 0
-          and r["train"]["pf"] > 1]
-    hit = [r for r in ok if r["train"]["win"] >= target_win]
-    if hit:
-        best = max(hit, key=lambda r: r["train"]["avg"])
-    elif ok:
-        best = max(ok, key=lambda r: r["train"]["avg"])
-    else:
-        best = None
-    return best, rows, cut
+    return select(rows, target_win, min_train), rows, cut
+
+
+def select(rows: list[dict], target_win: float, min_train: int, key: str = "train"):
+    """후보: 거래 >= min_train, 평균수익 > 0, PF > 1.
+       승률 >= target_win 인 후보가 있으면 그 중 평균수익 최대, 없으면 후보 중 평균수익 최대."""
+    ok = [r for r in rows if r[key]["n"] >= min_train and r[key]["avg"] > 0 and r[key]["pf"] > 1]
+    hit = [r for r in ok if r[key]["win"] >= target_win]
+    pool = hit or ok
+    return max(pool, key=lambda r: r[key]["avg"]) if pool else None
+
+
+WF_GRIDS = {  # 기간별 반복 검증용 (조합 수를 줄여 과최적화·실행시간 억제)
+    "score": dict(buy_th=[25, 40, 55], tp_atr=[1.0, 1.5, 2.0], tp2_atr=[3.0, 4.0],
+                  sl_atr=[2.0, 3.0], max_hold=[5, 10], max_loss=[0.05, 0.07]),
+    "pullback": dict(trend_ma=[60, 120], rsi_th=[35.0, 40.0, 45.0], rsi_confirm=[False, True],
+                     rsi_exit=[55.0], tp_atr=[1.5, 2.0], tp2_atr=[4.0], sl_atr=[2.5],
+                     max_loss=[0.05, 0.07], max_hold=[5, 10], market_filter=[False, True]),
+}
+
+
+def walk_forward(datasets: dict[str, pd.DataFrame], strategy: str, n_folds: int = 4,
+                 warm: float = 0.25, target_win: float = 60, min_train: int = 50,
+                 grid: dict | None = None):
+    """기간을 n_folds 개 구간으로 나눠, 각 구간 직전까지의 데이터로만 설정을 고르고
+       그 구간에서 성적을 잰다 (확장형 walk-forward). 반환: (구간별 결과, 전체 실전가정 성적, 최종설정)."""
+    grid = grid or WF_GRIDS[strategy]
+    dates = sorted(set().union(*[set(d.index) for d in datasets.values()]))
+    edges = np.linspace(int(len(dates) * warm), len(dates), n_folds + 1).astype(int)
+    bounds = [(dates[edges[f]], dates[edges[f + 1]] if edges[f + 1] < len(dates) else None)
+              for f in range(n_folds)]
+    sims = []
+    for combo in itertools.product(*grid.values()):
+        p = Params(**{**asdict(Params(strategy=strategy)), **dict(zip(grid.keys(), combo))})
+        if p.split and p.tp2_atr <= p.tp_atr:
+            continue
+        t = pd.DataFrame([x for code, d in datasets.items() for x in simulate(d, p, code)])
+        sims.append((p, t))
+    folds, oos, base_all = [], [], []
+    for lo, hi in bounds:
+        rows = []
+        for p, t in sims:
+            if t.empty:
+                continue
+            tr = t[t.entry_date < lo]
+            te = t[(t.entry_date >= lo) & ((t.entry_date < hi) if hi is not None else True)]
+            rows.append(dict(params=p, train=summarize(tr), test=summarize(te), te=te))
+        best = select(rows, target_win, min_train)
+        base = None
+        if best is not None:
+            oos.append(best["te"])
+            # 같은 익절/손절/보유기간 규칙으로 '아무 날이나' 샀을 때 (시장 흐름만 탄 성적)
+            q = Params(**{**asdict(best["params"]), "strategy": "always", "market_filter": False})
+            bt = pd.DataFrame([x for code, d in datasets.items() for x in simulate(d, q, code)])
+            if not bt.empty:
+                bt = bt[(bt.entry_date >= lo) & ((bt.entry_date < hi) if hi is not None else True)]
+                base = bt
+                base_all.append(bt)
+        folds.append(dict(start=lo, end=hi, best=best,
+                          base=summarize(base) if base is not None else None))
+    oos_t = pd.concat(oos) if oos else pd.DataFrame()
+    base_t = pd.concat(base_all) if base_all else pd.DataFrame()
+    final = select([dict(params=p, train=summarize(t)) for p, t in sims if not t.empty],
+                   target_win, min_train)
+    return folds, summarize(oos_t), final, len(sims), summarize(base_t)
 
 
 def latest(d: pd.DataFrame, p: Params, i: int = -1) -> tuple[bool, bool, list[str]]:

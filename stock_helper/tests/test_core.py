@@ -206,3 +206,36 @@ def test_pullback_signal():
     d["ma120"] = 110.0                                # 장기 추세 아래면 매수 안 함
     assert not backtest.signals(d, p)[0].any()
     assert label == "RSI회복" and not exs[0]          # RSI 50 < 청산선 60
+
+
+def test_universe_filters_and_parses():
+    assert data._keep("005930", "삼성전자")
+    assert not data._keep("005935", "삼성전자우")          # 우선주
+    assert not data._keep("123450", "하나스팩10호")        # 스팩
+    js = {"stocks": [{"itemCode": "005930", "stockName": "삼성전자", "stockEndType": "stock"},
+                     {"itemCode": "069500", "stockName": "KODEX 200", "stockEndType": "etf"},
+                     {"itemCode": "000660", "stockName": "SK하이닉스", "stockEndType": "stock"}]}
+    r = mock.Mock()
+    r.json = lambda: js
+    r.raise_for_status = lambda: None
+    with mock.patch("data.requests.get", side_effect=[r] + [mock.Mock(json=lambda: {"stocks": []},
+                    raise_for_status=lambda: None)] * 5), mock.patch("data.time.sleep"):
+        got = data.fetch_universe("KOSPI", 2)
+    assert got == [("005930", "삼성전자"), ("000660", "SK하이닉스")]
+
+
+def test_walk_forward_runs_and_has_baseline():
+    ds = {f"D{i}": backtest.prepare(data.synthetic(400, seed=i)) for i in range(4)}
+    grid = dict(buy_th=[25], tp_atr=[1.5], tp2_atr=[3.0], sl_atr=[2.0], max_hold=[5],
+                max_loss=[0.07])
+    folds, oos, final, n, base = backtest.walk_forward(ds, "score", n_folds=2, min_train=5,
+                                                       grid=grid)
+    assert n == 1 and len(folds) == 2
+    assert base["n"] >= oos["n"]   # 아무날 매수가 거래 수는 더 많아야 함
+
+
+def test_research_report_runs(capsys):
+    import research
+    ds = {f"D{i}": backtest.prepare(data.synthetic(300, seed=i)) for i in range(3)}
+    r = research.report(ds, horizon=5, min_n=5)
+    assert len(r) > 10 and "꾸준함" in capsys.readouterr().out
