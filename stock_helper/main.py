@@ -16,6 +16,7 @@ import argparse
 import os
 import sys
 
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -292,7 +293,10 @@ def cmd_optimize(a):
 
 
 def cmd_monitor(a):
-    realtime.monitor(read_codes(a.codes), backtest.Params.load(), a.interval, a.once, a.days)
+    p = backtest.Params.load()
+    if a.max_pos:
+        p.max_pos = a.max_pos
+    realtime.monitor(read_codes(a.codes), p, a.interval, a.once, a.days)
 
 
 def cmd_edge(a):
@@ -414,6 +418,59 @@ def cmd_walkforward(a):
     final["params"].save(extra={"walkforward_oos": good[st][1], "codes": codes})
 
 
+def cmd_portfolio(a):
+    import portfolio
+    codes = read_codes(a.codes or default_universe())
+    days = a.years * 250
+    datasets = prepare_all(codes, days, verbose=a.verbose)
+    saved = backtest.Params.load()
+    st = a.strategy or saved.strategy
+    print(f"계좌 시뮬레이션: {len(datasets)}종목 × 약 {a.years}년 | {STRATEGY_NAMES[st]} | "
+          f"동시 최대 {a.max_pos}종목, 종목당 계좌의 1/{a.max_pos}")
+
+    # (A) 실전 가정: 구간마다 '직전까지' 데이터로 고른 설정 사용
+    folds, _, _, _, _ = backtest.walk_forward(datasets, st, a.folds, target_win=a.target,
+                                              min_train=a.min_train)
+    plan = [(f["start"], f["end"], f["best"]["params"]) for f in folds if f["best"]]
+    if not plan:
+        print("구간별로 고를 수 있는 설정이 없습니다.")
+        return
+    res = portfolio.run(datasets, plan, a.max_pos)
+    eq = res["curve"]["equity"]
+    s = portfolio.stats(eq)
+    try:
+        demo = all(c.upper().startswith("DEMO") for c in codes)
+        bm = portfolio.benchmark(data.load_index("KOSPI", days + 30, cache_hours=24, demo=demo),
+                                 eq.index[0])
+        bs = portfolio.stats(bm)
+    except Exception:  # noqa: BLE001
+        bs = None
+    t = res["trades"]
+    print(f"\n[실전 가정 계좌] {eq.index[0].date()} ~ {eq.index[-1].date()} "
+          f"(약 {s['years']:.1f}년, 구간별 설정 사용)")
+    print(f"  최종 수익률 {s['total']:+.1f}% | 연평균 {s['cagr']:+.1f}% | "
+          f"최대 손실폭(고점 대비) {s['mdd']:.1f}% ({s['mdd_date'].date()})")
+    if bs:
+        print(f"  비교: 코스피 보유  {bs['total']:+.1f}% | 연평균 {bs['cagr']:+.1f}% | "
+              f"최대 손실폭 {bs['mdd']:.1f}%")
+    if not t.empty:
+        win = (t.ret > 0).mean() * 100
+        print(f"  실제 매매 {len(t)}회 (신호 {res['n_cand']}개 중, 자리 없어 놓친 신호 "
+              f"{res['skipped']}개) | 승률 {win:.1f}% | 거래당 평균 {t.ret.mean():+.2f}% | "
+              f"평균 보유 {t.held.mean():.1f}일")
+        print(f"  평균 보유 종목 수 {res['curve']['npos'].mean():.1f}개 / 최대 {a.max_pos}개")
+    print("\n  연도별 수익률")
+    print("   연도     계좌      코스피")
+    for y, v in s["yearly"].items():
+        b = bs["yearly"].get(y, np.nan) if bs else np.nan
+        print(f"   {y}  {v:+7.1f}%   {b:+7.1f}%")
+    print("\n  ※ 종목 목록이 '현재' 시가총액 상위라서 생존 편향이 있습니다. 실제 성적은 이보다 낮을 수 있습니다."
+          "\n  ※ 실전 전 모의매매(monitor → paper)로 몇 달간 확인하세요.")
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio_curve.csv")
+    res["curve"].to_csv(out, encoding="utf-8-sig")
+    print(f"  일별 계좌 평가액 저장: {out}")
+
+
 def cmd_paper(a):
     realtime.paper_report(a.target_n)
 
@@ -492,6 +549,7 @@ def main(argv=None):
     s5.add_argument("codes", nargs="?", default="watchlist.txt")
     s5.add_argument("--interval", type=float, default=5, help="점검 간격(분)")
     s5.add_argument("--once", action="store_true", help="1회만 점검 (장외 시간에도)")
+    s5.add_argument("--max-pos", type=int, default=None, help="동시 최대 보유 종목 수 (기본 5)")
     s7 = sub.add_parser("edge", help="신호 예측력 진단 (점수/영역별 이후 수익률)")
     s7.add_argument("codes", nargs="?", default="universe.txt")
     s7.add_argument("--horizon", type=int, default=5, help="보유 가정 일수 (기본 5)")
@@ -514,13 +572,23 @@ def main(argv=None):
             sp.add_argument("--folds", type=int, default=4, help="검증 구간 수 (기본 4)")
             sp.add_argument("--target", type=float, default=60)
             sp.add_argument("--min-train", type=int, default=50)
+    s9 = sub.add_parser("portfolio", help="계좌 단위 시뮬레이션 (동시 보유 수 제한)")
+    s9.add_argument("codes", nargs="?", default=None)
+    s9.add_argument("--years", type=int, default=5)
+    s9.add_argument("--max-pos", type=int, default=5, help="동시 최대 보유 종목 수 (기본 5)")
+    s9.add_argument("--strategy", choices=["score", "pullback", "reversal"], default=None,
+                    help="기본: 저장된 설정의 전략")
+    s9.add_argument("--folds", type=int, default=4)
+    s9.add_argument("--target", type=float, default=60)
+    s9.add_argument("--min-train", type=int, default=50)
+    s9.add_argument("--verbose", action="store_true")
     s6 = sub.add_parser("paper", help="모의매매 성적 집계")
     s6.add_argument("--target-n", type=int, default=100)
     a = p.parse_args(argv)
     {"analyze": cmd_analyze, "scan": cmd_scan, "backtest": cmd_backtest,
      "optimize": cmd_optimize, "monitor": cmd_monitor, "paper": cmd_paper,
      "edge": cmd_edge, "universe": cmd_universe, "research": cmd_research,
-     "walkforward": cmd_walkforward}[a.cmd](a)
+     "walkforward": cmd_walkforward, "portfolio": cmd_portfolio}[a.cmd](a)
 
 
 if __name__ == "__main__":

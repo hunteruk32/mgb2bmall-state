@@ -20,6 +20,8 @@ python main.py edge                      # 신호 예측력 진단 (점수/영�
 python main.py universe                  # 시가총액 상위 코스피 100 + 코스닥 50 → universe_wide.txt
 python main.py research                  # 신호별 '연도별' 초과수익 (매년 꾸준한 신호 찾기)
 python main.py walkforward               # 기간을 4번 바꿔가며 '과거로 고르고 다음 기간에 시험'
+python main.py portfolio                 # 계좌 시뮬레이션 (동시 최대 5종목, 코스피와 연도별 비교)
+python main.py monitor universe_wide.txt # 150종목 실시간 모의매매 (동시 최대 5종목)
 python main.py backtest 005930,000660 --show       # 저장된 설정으로 백테스트 (거래내역 포함)
 python main.py backtest universe.txt --tp 1 --tp2 3 --sl 2   # 설정 바꿔서 검증
 python main.py backtest universe.txt --no-market --no-split  # 시장필터/분할익절 끄고 비교

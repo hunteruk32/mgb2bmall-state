@@ -59,6 +59,7 @@ class Params:
     rsi_exit: float = 60          # pullback/reversal: RSI 회복 시 청산
     rev_signal: str = "rsi"       # reversal: "rsi"(RSI ≤ th) | "drop5"(5일 −th% 이하) | "ma20gap"(20일선 −th% 이하)
     rev_th: float = 30            # reversal: 기준값
+    max_pos: int = 5              # 모의매매/계좌: 동시 최대 보유 종목 수
 
     def save(self, path: str = PARAMS_PATH, extra: dict | None = None):
         with open(path, "w", encoding="utf-8") as f:
@@ -151,63 +152,92 @@ def prepare(raw: pd.DataFrame, mk: pd.DataFrame | None = None, start: int = 60) 
     return d
 
 
-def simulate(d: pd.DataFrame, p: Params, code: str = "") -> list[dict]:
-    o, h, l, c = (d[k].to_numpy() for k in ("open", "high", "low", "close"))
-    atr, idx = d["atr"].to_numpy(), d.index
-    sc = d["score"].to_numpy() if "score" in d else np.full(len(d), np.nan)
-    ent, exs, exit_label = signals(d, p)
-    n = len(d)
-    i, trades = 0, []
-    while i < n - 1:
-        if not ent[i]:
-            i += 1
-            continue
-        j = i + 1                      # 진입일
-        entry, a = o[j], atr[i]
-        if not entry > 0:              # 데이터 이상(시가 0) -> 건너뜀
-            i += 1
-            continue
-        stop = entry - stop_distance(p, entry, a)
-        t1, t2 = entry + p.tp_atr * a, entry + p.tp2_atr * a
-        be = entry * (1 + p.cost)      # 본전 스탑
-        half = None                    # 1차 익절한 절반의 수익률
-        exit_px = why = None
-        k = j
-        while k < n:
-            if half is None:
-                if l[k] <= stop:
-                    exit_px, why, ex = min(o[k], stop), "손절", k
-                elif h[k] >= t1:
-                    px1 = max(o[k], t1)
-                    if not p.split:
-                        exit_px, why, ex = px1, "익절", k
-                    else:
-                        half, stop = px1 / entry - 1, be
-                        if h[k] >= t2:
-                            exit_px, why, ex = max(o[k], t2), "2차익절", k
-                        elif (c[k] < o[k] and l[k] <= be) or (c[k] >= o[k] and c[k] <= be):
-                            exit_px, why, ex = be, "1차익절+본전", k
-            else:
-                if l[k] <= stop:
-                    exit_px, why, ex = min(o[k], stop), "1차익절+본전", k
-                elif h[k] >= t2:
-                    exit_px, why, ex = max(o[k], t2), "2차익절", k
-            if exit_px is None and (exs[k] or k - j + 1 >= p.max_hold) and k + 1 < n:
-                exit_px, ex = o[k + 1], k + 1
-                why = ("1차익절+" if half is not None else "") + \
-                      (exit_label if exs[k] else "기간만료")
-            if exit_px is not None:
-                break
-            k += 1
-        if exit_px is None:            # 데이터 끝까지 보유 중 -> 집계 제외
+def _arrays(d: pd.DataFrame, p: Params) -> dict:
+    ent, exs, label = signals(d, p)
+    return dict(o=d["open"].to_numpy(), h=d["high"].to_numpy(), l=d["low"].to_numpy(),
+                c=d["close"].to_numpy(), atr=d["atr"].to_numpy(), idx=d.index,
+                sc=d["score"].to_numpy() if "score" in d else np.full(len(d), np.nan),
+                rsi=d["rsi"].to_numpy() if "rsi" in d else np.full(len(d), np.nan), ent=ent, exs=exs, label=label, n=len(d))
+
+
+def _trade(A: dict, p: Params, i: int, code: str) -> tuple[dict | None, int | None]:
+    """i일 장마감 신호 → i+1일 시가 진입 한 건을 끝까지 추적. (거래, 청산 인덱스).
+    시가 이상이면 (None, None), 데이터 끝까지 보유 중이면 (None, -1)."""
+    o, h, l, c, n = A["o"], A["h"], A["l"], A["c"], A["n"]
+    j = i + 1                          # 진입일
+    entry, a = o[j], A["atr"][i]
+    if not entry > 0:                  # 데이터 이상(시가 0) -> 건너뜀
+        return None, None
+    stop = entry - stop_distance(p, entry, a)
+    t1, t2 = entry + p.tp_atr * a, entry + p.tp2_atr * a
+    be = entry * (1 + p.cost)          # 본전 스탑
+    half = None                        # 1차 익절한 절반의 수익률
+    exit_px = why = None
+    k = j
+    while k < n:
+        if half is None:
+            if l[k] <= stop:
+                exit_px, why, ex = min(o[k], stop), "손절", k
+            elif h[k] >= t1:
+                px1 = max(o[k], t1)
+                if not p.split:
+                    exit_px, why, ex = px1, "익절", k
+                else:
+                    half, stop = px1 / entry - 1, be
+                    if h[k] >= t2:
+                        exit_px, why, ex = max(o[k], t2), "2차익절", k
+                    elif (c[k] < o[k] and l[k] <= be) or (c[k] >= o[k] and c[k] <= be):
+                        exit_px, why, ex = be, "1차익절+본전", k
+        else:
+            if l[k] <= stop:
+                exit_px, why, ex = min(o[k], stop), "1차익절+본전", k
+            elif h[k] >= t2:
+                exit_px, why, ex = max(o[k], t2), "2차익절", k
+        if exit_px is None and (A["exs"][k] or k - j + 1 >= p.max_hold) and k + 1 < n:
+            exit_px, ex = o[k + 1], k + 1
+            why = ("1차익절+" if half is not None else "") + \
+                  (A["label"] if A["exs"][k] else "기간만료")
+        if exit_px is not None:
             break
-        r2 = exit_px / entry - 1
-        ret = (r2 if half is None else 0.5 * half + 0.5 * r2) - p.cost
-        trades.append(dict(code=code, entry_date=idx[j], entry=entry, exit_date=idx[ex],
-                           exit=exit_px, ret=ret * 100, reason=why, held=ex - j + 1,
-                           score=sc[i]))
+        k += 1
+    if exit_px is None:                # 데이터 끝까지 보유 중 -> 집계 제외
+        return None, -1
+    r2 = exit_px / entry - 1
+    ret = (r2 if half is None else 0.5 * half + 0.5 * r2) - p.cost
+    idx = A["idx"]
+    return dict(code=code, entry_date=idx[j], entry=entry, exit_date=idx[ex], exit=exit_px,
+                ret=ret * 100, reason=why, held=ex - j + 1, score=A["sc"][i],
+                rsi=A["rsi"][i]), ex
+
+
+def simulate(d: pd.DataFrame, p: Params, code: str = "") -> list[dict]:
+    """한 종목을 한 번에 한 포지션씩 순서대로 매매."""
+    A = _arrays(d, p)
+    i, trades = 0, []
+    while i < A["n"] - 1:
+        if not A["ent"][i]:
+            i += 1
+            continue
+        t, ex = _trade(A, p, i, code)
+        if ex is None:
+            i += 1
+            continue
+        if ex == -1:
+            break
+        trades.append(t)
         i = ex                         # 청산일 종가부터 다시 신호 탐색
     return trades
+
+
+def candidates(d: pd.DataFrame, p: Params, code: str = "") -> list[dict]:
+    """신호가 난 '모든' 날에 대해 독립적으로 매매를 추적 (계좌 시뮬레이션용 후보)."""
+    A = _arrays(d, p)
+    out = []
+    for i in np.flatnonzero(A["ent"][: A["n"] - 1]):
+        t, ex = _trade(A, p, int(i), code)
+        if t is not None:
+            out.append(t)
+    return out
 
 
 def summarize(trades: list[dict] | pd.DataFrame) -> dict:

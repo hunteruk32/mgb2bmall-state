@@ -255,3 +255,34 @@ def test_reversal_signals():
         assert exs[-1] and not exs[2] and label == "RSI회복"
     assert len(backtest.reversal_combos()) == 144
     assert "반등" in backtest.Params(strategy="reversal").describe()
+
+
+def test_portfolio_accounting_and_slots():
+    import portfolio
+    idx = pd.bdate_range("2026-01-01", periods=6)
+    base = dict(open=100.0, high=100.0, low=100.0, close=100.0, atr=1.0, rsi=50.0, score=0.0)
+    ds = {}
+    for code, r in (("A", 20.0), ("B", 25.0)):
+        d = pd.DataFrame(base, index=idx)
+        d.loc[idx[1], "rsi"] = r                       # 1일째 장마감 신호 -> 2일째 시가 진입
+        d.loc[idx[3]:, ["open", "high", "close"]] = 110.0   # 이후 상승
+        ds[code] = d
+    p = backtest.Params(strategy="reversal", rev_signal="rsi", rev_th=30, rsi_exit=99,
+                        max_hold=2, split=False, tp_atr=50, cost=0, market_filter=False,
+                        max_loss=0, sl_atr=50)
+    res = portfolio.run(ds, [(idx[0], None, p)], max_pos=1)
+    # 자리가 1개라 RSI 더 낮은 A만 매수, B는 놓침
+    assert list(res["trades"].code) == ["A"] and res["skipped"] == 1
+    # 2일 보유 후 다음날 시가(110)에 청산 -> +10%, 계좌의 1/1 투자 -> 1.10
+    assert abs(res["curve"]["equity"].iloc[-1] - 1.10) < 1e-9
+
+
+def test_realtime_respects_max_pos():
+    from datetime import datetime
+    import realtime
+    p = backtest.Params(buy_th=-100, max_pos=1)
+    loaders = {c: data.synthetic(150, seed=i) for i, c in enumerate(["X", "Y"])}
+    t = datetime(2026, 10, 8, 15, 20, tzinfo=realtime.KST)
+    lg = realtime.step(["X", "Y"], p, lambda c: (loaders[c], c), t,
+                       realtime.read_ledger("/nonexistent"), log=lambda *a: None)
+    assert (lg["status"] == "open").sum() == 1

@@ -67,7 +67,7 @@ def step(codes: list[str], p: Params, loader, t: datetime, ledger: pd.DataFrame,
     if not mkt_ok:
         log(f"  ⛔ 시장 필터: 신규 매수 중단 ({mkt[1]})")
     stamp = t.strftime("%Y-%m-%d %H:%M")
-    rows = []
+    rows, cands = [], []
     for code in codes:
         try:
             raw, name = loader(code)
@@ -116,28 +116,43 @@ def step(codes: list[str], p: Params, loader, t: datetime, ledger: pd.DataFrame,
                 ledger.loc[k, ["status", "exit_date", "exit", "ret", "reason"]] = \
                     ["closed", stamp, price, round(ret, 2), why]
                 log(f"  🔔 [모의 청산] {name}({code}) {price:,.0f}원 {why} → 총 {ret:+.2f}%")
-        elif latest(d, p)[0]:                               # ---- 신규 진입
-            if not mkt_ok:
-                log(f"  ✋ [매수 보류] {name}({code}) 점수 {s.score:+.0f} — 시장 필터")
-            elif t.time() >= ENTRY_T and market_open(t):
-                new = dict(code=code, name=name, entry_date=stamp, entry=price,
-                           stop=round(price - stop_distance(p, price, atr)),
-                           target=round(price + p.tp_atr * atr),
-                           target2=round(price + p.tp2_atr * atr) if p.split else np.nan,
-                           half_ret=np.nan, score=s.score, status="open", exit_date="",
-                           exit=np.nan, ret=np.nan, reason="")
-                ledger = ledger.reset_index(drop=True)
-                ledger.loc[len(ledger)] = new
-                tp = (f"1차 {new['target']:,}(절반) / 2차 {new['target2']:,}" if p.split
-                      else f"익절 {new['target']:,}")
-                log(f"  🟢 [모의 매수] {name}({code}) {price:,.0f}원 점수 {s.score:+.0f} "
-                    f"손절 {new['stop']:,} / {tp}")
-            else:
-                log(f"  👀 [매수 후보] {name}({code}) {price:,.0f}원 점수 {s.score:+.0f} "
-                    f"(15:15 이후 유지되면 진입)")
-    if rows:
+        elif latest(d, p)[0]:                               # ---- 신규 진입 후보
+            r = d.iloc[-1]
+            prio = -s.score if p.strategy == "score" else float(r.rsi)
+            cands.append(dict(prio=prio, code=code, name=name, price=price, atr=atr,
+                              score=s.score, rsi=float(r.rsi)))
+
+    # ---- 신규 진입: 우선순위(반등/눌림목 = RSI 낮은 순, 점수 = 점수 높은 순)대로 빈 자리만큼
+    n_open = int((ledger["status"] == "open").sum())
+    slots = max(0, p.max_pos - n_open)
+    can_enter = mkt_ok and t.time() >= ENTRY_T and market_open(t)
+    for k, c in enumerate(sorted(cands, key=lambda x: x["prio"])):
+        tag = f"{c['name']}({c['code']}) {c['price']:,.0f}원 RSI {c['rsi']:.0f} 점수 {c['score']:+.0f}"
+        if not mkt_ok:
+            log(f"  ✋ [매수 보류] {tag} — 시장 필터")
+        elif k >= slots:
+            log(f"  ⏸ [자리 없음] {tag} — 보유 {n_open}/{p.max_pos}종목")
+        elif can_enter:
+            price, atr = c["price"], c["atr"]
+            new = dict(code=c["code"], name=c["name"], entry_date=stamp, entry=price,
+                       stop=round(price - stop_distance(p, price, atr)),
+                       target=round(price + p.tp_atr * atr),
+                       target2=round(price + p.tp2_atr * atr) if p.split else np.nan,
+                       half_ret=np.nan, score=c["score"], status="open", exit_date="",
+                       exit=np.nan, ret=np.nan, reason="")
+            ledger = ledger.reset_index(drop=True)
+            ledger.loc[len(ledger)] = new
+            tp = (f"1차 {new['target']:,}(절반) / 2차 {new['target2']:,}" if p.split
+                  else f"익절 {new['target']:,}")
+            log(f"  🟢 [모의 매수] {tag} 손절 {new['stop']:,} / {tp}")
+        else:
+            log(f"  👀 [매수 후보] {tag} (15:15 이후 유지되면 진입)")
+    if rows and len(rows) <= 30:
         log(pd.DataFrame(rows, columns=["코드", "종목", "현재가", "점수", "의견"])
             .sort_values("점수", ascending=False).to_string(index=False))
+    elif rows:
+        log(f"  {len(rows)}종목 점검 완료 | 매수 후보 {len(cands)}개 | "
+            f"보유 {int((ledger['status'] == 'open').sum())}/{p.max_pos}")
     return ledger
 
 
@@ -189,5 +204,7 @@ def paper_report(target_n: int = 100, path: str = LEDGER) -> dict:
         print(f"  승률 {st['win']:.1f}% | 평균 {st['avg']:+.2f}% | 평균이익 {st['avg_win']:+.2f}% "
               f"| 평균손실 {st['avg_loss']:+.2f}% | PF {st['pf']:.2f} | 최대연속손실 {st['max_losing']}회")
         if st["n"] >= target_n:
-            print("  ✅ 목표 승률 80% 달성" if st["win"] >= 80 else "  ❌ 목표 승률 80% 미달")
+            ok = st["avg"] > 0 and st["pf"] > 1.1
+            print(f"  {'✅' if ok else '❌'} {target_n}회 완료: 거래당 평균 {st['avg']:+.2f}%, "
+                  f"PF {st['pf']:.2f} → {'실전 소액 시작 검토 가능' if ok else '실전 사용 비추천'}")
     return st
