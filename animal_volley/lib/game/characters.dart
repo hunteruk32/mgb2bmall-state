@@ -178,7 +178,7 @@ class _Ctx {
   (Offset, double) armPose() {
     switch (pose) {
       case Pose.spike:
-        return (const Offset(6, -12), -1.6);
+        return (const Offset(-2, -14), -0.75);
       case Pose.win:
         return (const Offset(10, -2), -0.85 + math.sin(t * 10) * 0.25);
       case Pose.jump:
@@ -195,7 +195,7 @@ class _Ctx {
   /// 앞팔. 스파이크 때는 머리 위로 번쩍 든다.
   void frontArm(Color color, {double len = 22, double thick = 13}) {
     final (at, ang) = armPose();
-    if (pose == Pose.spike) len *= 1.7;
+    if (pose == Pose.spike) len *= 1.5;
     if (pose == Pose.win) len *= 1.3;
     c.save();
     c.translate(at.dx, at.dy);

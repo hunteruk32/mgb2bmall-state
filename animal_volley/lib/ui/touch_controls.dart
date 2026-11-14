@@ -6,8 +6,10 @@ class TouchControlsController {
   int bits = 0;
 }
 
-/// 멀티터치 버튼: 왼쪽 아래 ◀ ▶, 오른쪽 아래 점프 / 스파이크.
-/// 손가락을 버튼 사이로 미끄러뜨려도 자연스럽게 바뀌도록 위치로 판정한다.
+/// 터치 조작
+/// - 화면 왼쪽 절반: 조이스틱. 엄지를 댄 자리에 생기고, 좌우로 밀면 이동,
+///   위로 밀면 점프.
+/// - 화면 오른쪽 절반: 스파이크 버튼 (땅에서 방향과 함께 누르면 다이빙)
 class TouchControls extends StatefulWidget {
   final TouchControlsController controller;
   final Listenable repaint;
@@ -18,49 +20,71 @@ class TouchControls extends StatefulWidget {
   State<TouchControls> createState() => _TouchControlsState();
 }
 
-class _Btn {
-  final int bit;
-  final String label;
-  final Offset center;
-  final double radius;
-  _Btn(this.bit, this.label, this.center, this.radius);
+class _Stick {
+  final int pointer;
+  final Offset origin;
+  Offset knob;
+  _Stick(this.pointer, this.origin) : knob = origin;
 }
 
 class _TouchControlsState extends State<TouchControls> {
-  final _pointers = <int, Offset>{};
   Size _size = Size.zero;
+  _Stick? _stick;
+  final _hitPointers = <int>{};
 
-  List<_Btn> _buttons(Size s) {
-    final r = math.min(s.height * 0.11, 50.0);
-    final y = s.height - r - 8;
-    return [
-      _Btn(Input.left, '◀', Offset(r * 1.4, y), r),
-      _Btn(Input.right, '▶', Offset(r * 3.9, y), r),
-      _Btn(Input.jump, '점프', Offset(s.width - r * 3.9, y), r),
-      _Btn(Input.hit, '스파이크', Offset(s.width - r * 1.4, y - r * 0.35), r * 1.05),
-    ];
-  }
+  double get _stickRadius => math.min(_size.height * 0.13, 60.0);
+  double get _hitRadius => math.min(_size.height * 0.15, 66.0);
 
-  /// 손가락 위치 → 버튼. 화면 왼쪽 절반은 이동, 오른쪽 절반은 점프/스파이크.
-  int _bitAt(Offset p) {
-    final b = _buttons(_size);
-    if (p.dx < _size.width / 2) {
-      if (p.dy < _size.height * 0.35) return 0;
-      final mid = (b[0].center.dx + b[1].center.dx) / 2;
-      return p.dx < mid ? Input.left : Input.right;
-    } else {
-      if (p.dy < _size.height * 0.35) return 0;
-      final mid = (b[2].center.dx + b[3].center.dx) / 2;
-      return p.dx < mid ? Input.jump : Input.hit;
-    }
-  }
+  /// 아무것도 안 만질 때 조이스틱이 보이는 자리
+  Offset get _restOrigin =>
+      Offset(_stickRadius * 1.6, _size.height - _stickRadius * 1.35);
+  Offset get _hitCenter =>
+      Offset(_size.width - _hitRadius * 1.4, _size.height - _hitRadius * 1.25);
 
   void _update() {
     int bits = 0;
-    for (final p in _pointers.values) {
-      bits |= _bitAt(p);
+    final s = _stick;
+    if (s != null) {
+      final d = s.knob - s.origin;
+      final r = _stickRadius;
+      if (d.dx < -r * 0.3) bits |= Input.left;
+      if (d.dx > r * 0.3) bits |= Input.right;
+      if (d.dy < -r * 0.5) bits |= Input.jump;
     }
+    if (_hitPointers.isNotEmpty) bits |= Input.hit;
     widget.controller.bits = bits;
+  }
+
+  bool _isStickArea(Offset p) =>
+      p.dx < _size.width / 2 && p.dy > _size.height * 0.3;
+  bool _isHitArea(Offset p) =>
+      p.dx >= _size.width / 2 && p.dy > _size.height * 0.3;
+
+  void _down(PointerDownEvent e) {
+    final p = e.localPosition;
+    if (_isStickArea(p) && _stick == null) {
+      _stick = _Stick(e.pointer, p);
+    } else if (_isHitArea(p)) {
+      _hitPointers.add(e.pointer);
+    }
+    _update();
+  }
+
+  void _move(PointerMoveEvent e) {
+    final s = _stick;
+    if (s != null && s.pointer == e.pointer) {
+      var d = e.localPosition - s.origin;
+      final r = _stickRadius;
+      if (d.distance > r) d = d / d.distance * r;
+      s.knob = s.origin + d;
+      _update();
+    }
+  }
+
+  void _up(int pointer) {
+    if (_stick?.pointer == pointer) _stick = null;
+    _hitPointers.remove(pointer);
+    _update();
   }
 
   @override
@@ -69,26 +93,13 @@ class _TouchControlsState extends State<TouchControls> {
       _size = box.biggest;
       return Listener(
         behavior: HitTestBehavior.translucent,
-        onPointerDown: (e) {
-          _pointers[e.pointer] = e.localPosition;
-          _update();
-        },
-        onPointerMove: (e) {
-          _pointers[e.pointer] = e.localPosition;
-          _update();
-        },
-        onPointerUp: (e) {
-          _pointers.remove(e.pointer);
-          _update();
-        },
-        onPointerCancel: (e) {
-          _pointers.remove(e.pointer);
-          _update();
-        },
+        onPointerDown: _down,
+        onPointerMove: _move,
+        onPointerUp: (e) => _up(e.pointer),
+        onPointerCancel: (e) => _up(e.pointer),
         child: CustomPaint(
           size: _size,
-          painter: _ControlsPainter(
-              _buttons(_size), widget.controller, widget.repaint),
+          painter: _ControlsPainter(this, widget.repaint),
         ),
       );
     });
@@ -96,42 +107,89 @@ class _TouchControlsState extends State<TouchControls> {
 }
 
 class _ControlsPainter extends CustomPainter {
-  final List<_Btn> buttons;
-  final TouchControlsController ctl;
-  _ControlsPainter(this.buttons, this.ctl, Listenable repaint)
-      : super(repaint: repaint);
+  final _TouchControlsState s;
+  _ControlsPainter(this.s, Listenable repaint) : super(repaint: repaint);
 
   @override
   void paint(Canvas canvas, Size size) {
-    for (final b in buttons) {
-      final on = ctl.bits & b.bit != 0;
-      canvas.drawCircle(
-          b.center,
-          b.radius,
-          Paint()
-            ..color = Colors.white
-                .withValues(alpha: on ? 0.45 : 0.12));
-      canvas.drawCircle(
-          b.center,
-          b.radius,
-          Paint()
-            ..style = PaintingStyle.stroke
-            ..strokeWidth = 2.5
-            ..color = Colors.white.withValues(alpha: on ? 0.8 : 0.45));
-      final tp = TextPainter(
-        text: TextSpan(
-          text: b.label,
-          style: TextStyle(
-            color: Colors.white.withValues(alpha: on ? 0.95 : 0.7),
-            shadows: const [Shadow(color: Color(0x66000000), blurRadius: 3)],
-            fontSize: b.label.length > 2 ? b.radius * 0.36 : b.radius * 0.55,
-            fontWeight: FontWeight.w900,
-          ),
+    final bits = s.widget.controller.bits;
+    final stick = s._stick;
+    final r = s._stickRadius;
+    final origin = stick?.origin ?? s._restOrigin;
+    final knob = stick?.knob ?? origin;
+    final active = stick != null;
+
+    // 조이스틱 받침
+    canvas.drawCircle(origin, r,
+        Paint()..color = Colors.white.withValues(alpha: active ? 0.22 : 0.12));
+    canvas.drawCircle(
+        origin,
+        r,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.5
+          ..color = Colors.white.withValues(alpha: active ? 0.7 : 0.45));
+    // 방향 표시 (◀ ▶ ▲점프)
+    _arrow(canvas, origin + Offset(-r * 0.72, 0), math.pi, bits & Input.left != 0, r);
+    _arrow(canvas, origin + Offset(r * 0.72, 0), 0, bits & Input.right != 0, r);
+    _arrow(canvas, origin + Offset(0, -r * 0.72), -math.pi / 2, bits & Input.jump != 0, r);
+    _text(canvas, '점프', origin + Offset(0, -r - 10), r * 0.24,
+        bits & Input.jump != 0);
+    // 손잡이
+    canvas.drawCircle(knob, r * 0.42,
+        Paint()..color = Colors.white.withValues(alpha: active ? 0.75 : 0.35));
+    canvas.drawCircle(
+        knob,
+        r * 0.42,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2
+          ..color = const Color(0x55000000));
+
+    // 스파이크 버튼
+    final hc = s._hitCenter;
+    final hr = s._hitRadius;
+    final on = bits & Input.hit != 0;
+    canvas.drawCircle(hc, hr,
+        Paint()..color = Colors.white.withValues(alpha: on ? 0.45 : 0.14));
+    canvas.drawCircle(
+        hc,
+        hr,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.5
+          ..color = Colors.white.withValues(alpha: on ? 0.85 : 0.5));
+    _text(canvas, '스파이크', hc, hr * 0.3, on);
+  }
+
+  void _arrow(Canvas c, Offset at, double angle, bool on, double r) {
+    final size = r * 0.16;
+    c.save();
+    c.translate(at.dx, at.dy);
+    c.rotate(angle);
+    final p = Path()
+      ..moveTo(size, 0)
+      ..lineTo(-size * 0.6, -size)
+      ..lineTo(-size * 0.6, size)
+      ..close();
+    c.drawPath(p, Paint()..color = Colors.white.withValues(alpha: on ? 0.95 : 0.55));
+    c.restore();
+  }
+
+  void _text(Canvas c, String t, Offset center, double fontSize, bool on) {
+    final tp = TextPainter(
+      text: TextSpan(
+        text: t,
+        style: TextStyle(
+          color: Colors.white.withValues(alpha: on ? 0.95 : 0.7),
+          fontSize: fontSize,
+          fontWeight: FontWeight.w900,
+          shadows: const [Shadow(color: Color(0x66000000), blurRadius: 3)],
         ),
-        textDirection: TextDirection.ltr,
-      )..layout();
-      tp.paint(canvas, b.center - Offset(tp.width / 2, tp.height / 2));
-    }
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(c, center - Offset(tp.width / 2, tp.height / 2));
   }
 
   @override
