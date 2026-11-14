@@ -14,6 +14,9 @@ class GameSettings extends ChangeNotifier {
   /// 캐릭터 이동 속도 배율 (1.0 = 기본)
   double moveSpeed = 1.0;
 
+  /// 조이스틱 감도 0.0(둔함) ~ 1.0(아주 민감)
+  double stickSensitivity = 0.7;
+
   /// 0.0 ~ 1.0
   double bgmVolume = 0.6;
   double sfxVolume = 0.9;
@@ -27,13 +30,16 @@ class GameSettings extends ChangeNotifier {
       moveSpeed = p.getDouble('moveSpeed') ?? moveSpeed;
       bgmVolume = p.getDouble('bgmVolume') ?? bgmVolume;
       sfxVolume = p.getDouble('sfxVolume') ?? sfxVolume;
+      stickSensitivity = p.getDouble('stickSensitivity') ?? stickSensitivity;
     } catch (_) {
       // 저장소를 못 쓰는 환경이면 기본값으로 진행
     }
     notifyListeners();
   }
 
-  void update({double? ball, double? move, double? bgm, double? sfx}) {
+  void update(
+      {double? ball, double? move, double? bgm, double? sfx, double? stick}) {
+    if (stick != null) stickSensitivity = stick;
     if (ball != null) ballSpeed = ball;
     if (move != null) moveSpeed = move;
     if (bgm != null) bgmVolume = bgm;
@@ -45,6 +51,7 @@ class GameSettings extends ChangeNotifier {
       p.setDouble('moveSpeed', moveSpeed);
       p.setDouble('bgmVolume', bgmVolume);
       p.setDouble('sfxVolume', sfxVolume);
+      p.setDouble('stickSensitivity', stickSensitivity);
     }
   }
 

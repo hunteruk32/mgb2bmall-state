@@ -103,6 +103,7 @@ class TitleScreen extends StatelessWidget {
 
 const _howTo = '''[왼쪽] 조이스틱
  · 왼쪽 화면 아무 데나 엄지를 대면 생겨요
+ · 반대로 조금만 밀어도 바로 방향이 바뀌어요 (감도는 설정에서)
  · 좌우로 밀기 → 이동
  · 위로 밀기 → 점프 (대각선으로 밀면 이동하면서 점프)
 

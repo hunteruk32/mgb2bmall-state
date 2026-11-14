@@ -48,6 +48,42 @@ class SettingsScreen extends StatelessWidget {
               style: TextStyle(fontSize: 12, color: Colors.black54),
             ),
             const SizedBox(height: 12),
+            _section('조작'),
+            Row(
+              children: [
+                const Icon(Icons.gamepad, color: kInk),
+                const SizedBox(width: 10),
+                const SizedBox(
+                  width: 120,
+                  child: Text('조이스틱 감도',
+                      style: TextStyle(fontWeight: FontWeight.w700, color: kInk)),
+                ),
+                Expanded(
+                  child: Slider(
+                    value: s.stickSensitivity,
+                    divisions: 10,
+                    onChanged: (v) => s.update(stick: v),
+                  ),
+                ),
+                SizedBox(
+                  width: 110,
+                  child: Text(
+                    s.stickSensitivity < 0.35
+                        ? '둔하게'
+                        : s.stickSensitivity < 0.75
+                            ? '보통'
+                            : '민감하게',
+                    textAlign: TextAlign.right,
+                    style: const TextStyle(color: kInk),
+                  ),
+                ),
+              ],
+            ),
+            const Text(
+              '민감할수록 엄지를 조금만 움직여도 이동·점프해요.',
+              style: TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+            const SizedBox(height: 12),
             _section('소리'),
             _volumeRow(
               icon: Icons.music_note,
