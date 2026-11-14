@@ -5,13 +5,17 @@ import 'package:flutter/material.dart';
 import '../game/characters.dart';
 import '../game/cpu.dart';
 import '../net/session.dart';
+import '../settings.dart';
 import 'common.dart';
 import 'game_screen.dart';
 
 /// 캐릭터 선택. [session]이 없으면 CPU 연습 모드.
 class SelectScreen extends StatefulWidget {
   final NetSession? session;
-  const SelectScreen({super.key, this.session});
+
+  /// true면 '서브 연습' (상대 없음)
+  final bool serveOnly;
+  const SelectScreen({super.key, this.session, this.serveOnly = false});
 
   @override
   State<SelectScreen> createState() => _SelectScreenState();
@@ -67,7 +71,12 @@ class _SelectScreenState extends State<SelectScreen> {
         if (net!.isHost) _maybeStart();
         break;
       case Msg.start:
-        if (!net!.isHost) _startGame();
+        if (!net!.isHost) {
+          // 호스트의 속도 설정을 그대로 따른다
+          final ball = m.length > 2 ? m[1] / 100 : 1.0;
+          final move = m.length > 2 ? m[2] / 100 : 1.0;
+          _startGame(ballSpeed: ball, moveSpeed: move);
+        }
         break;
       case Msg.leave:
         _peerLeft();
@@ -110,12 +119,17 @@ class _SelectScreenState extends State<SelectScreen> {
 
   void _maybeStart() {
     if (ready && net!.peerReady && peer != null && peer != my) {
-      net!.send([Msg.start]);
+      final s = GameSettings.instance;
+      net!.send([
+        Msg.start,
+        (s.ballSpeed * 100).round().clamp(1, 255),
+        (s.moveSpeed * 100).round().clamp(1, 255),
+      ]);
       _startGame();
     }
   }
 
-  Future<void> _startGame() async {
+  Future<void> _startGame({double? ballSpeed, double? moveSpeed}) async {
     if (_inGame) return;
     _inGame = true;
     _unlisten();
@@ -136,7 +150,14 @@ class _SelectScreenState extends State<SelectScreen> {
     final result = await Navigator.push<GameExit>(
       context,
       MaterialPageRoute(
-        builder: (_) => GameScreen(looks: looks, session: net, cpuLevel: level),
+        builder: (_) => GameScreen(
+          looks: looks,
+          session: net,
+          cpuLevel: level,
+          solo: widget.serveOnly,
+          ballSpeed: ballSpeed ?? GameSettings.instance.ballSpeed,
+          moveSpeed: moveSpeed ?? GameSettings.instance.moveSpeed,
+        ),
       ),
     );
     _inGame = false;
@@ -332,7 +353,9 @@ class _SelectScreenState extends State<SelectScreen> {
                           ? const Center(child: Text('상대 선택 중...'))
                           : _side(net!.peerName ?? '상대', opp, net!.peerReady,
                               facing: -1))
-                      : _cpuSide(),
+                      : widget.serveOnly
+                          ? _serveSide()
+                          : _cpuSide(),
                 ),
               ],
             ),
@@ -372,6 +395,21 @@ class _SelectScreenState extends State<SelectScreen> {
                   fontSize: 12,
                   fontWeight: FontWeight.w700,
                   color: isReady ? Colors.green[700] : Colors.black45)),
+      ],
+    );
+  }
+
+  Widget _serveSide() {
+    return const Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(Icons.sports_volleyball, size: 44, color: kInk),
+        Text('서브 연습',
+            style: TextStyle(fontWeight: FontWeight.w800, color: kInk)),
+        SizedBox(height: 4),
+        Text('상대 없이 공이 계속\n내 머리 위로 올라와요.\n네트 너머로 넘기면 성공!',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 12, color: kInk)),
       ],
     );
   }

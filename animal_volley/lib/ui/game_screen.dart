@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
+import '../audio.dart';
 import '../game/characters.dart';
 import '../game/court_painter.dart';
 import '../game/cpu.dart';
@@ -17,11 +18,19 @@ class GameScreen extends StatefulWidget {
   final List<CharacterLook> looks;
   final NetSession? session;
   final CpuLevel cpuLevel;
+
+  /// 서브 연습 모드
+  final bool solo;
+  final double ballSpeed;
+  final double moveSpeed;
   const GameScreen(
       {super.key,
       required this.looks,
       this.session,
-      this.cpuLevel = CpuLevel.normal});
+      this.cpuLevel = CpuLevel.normal,
+      this.solo = false,
+      this.ballSpeed = 1.0,
+      this.moveSpeed = 1.0});
 
   @override
   State<GameScreen> createState() => _GameScreenState();
@@ -38,6 +47,9 @@ class _GameScreenState extends State<GameScreen>
   CpuBrain? cpu;
 
   Duration _last = Duration.zero;
+  late List<int> _lastScores;
+  int _lastTries = 0;
+  Phase _lastPhase = Phase.serve;
   double _acc = 0;
   double _time = 0;
   bool paused = false;
@@ -60,8 +72,16 @@ class _GameScreenState extends State<GameScreen>
   void initState() {
     super.initState();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-    world = World(authoritative: isHost);
-    if (!online) cpu = CpuBrain(1, level: widget.cpuLevel);
+    world = World(
+      authoritative: isHost,
+      solo: widget.solo,
+      ballSpeed: widget.ballSpeed,
+      moveSpeed: widget.moveSpeed,
+    );
+    if (!online && !widget.solo) cpu = CpuBrain(1, level: widget.cpuLevel);
+    _lastScores = List.of(world.scores);
+    GameAudio.instance.playBgm(Bgm.game);
+    GameAudio.instance.play(Sfx.whistle);
     if (online) {
       _msgSub = net!.messages.listen(_onMsg);
       _statusSub = net!.statusChanges.listen((s) {
@@ -73,6 +93,7 @@ class _GameScreenState extends State<GameScreen>
 
   @override
   void dispose() {
+    GameAudio.instance.playBgm(Bgm.menu);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     _ticker.dispose();
     _msgSub?.cancel();
@@ -127,7 +148,7 @@ class _GameScreenState extends State<GameScreen>
       final inputs = [0, 0];
       inputs[mySide] = mine;
       if (!online) {
-        inputs[1] = cpu!.think(world);
+        inputs[1] = cpu?.think(world) ?? 0;
       } else if (isHost) {
         inputs[1] = _remoteInput;
       } else {
@@ -136,9 +157,7 @@ class _GameScreenState extends State<GameScreen>
       }
       final before = world.phase;
       world.step(inputs);
-      if (world.events.contains(GameEvent.spike)) {
-        HapticFeedback.lightImpact();
-      }
+      _sounds();
       if (before != Phase.gameOver && world.phase == Phase.gameOver) {
         setState(() {});
       }
@@ -153,7 +172,61 @@ class _GameScreenState extends State<GameScreen>
       }
     }
     if (_acc > _dt * 5) _acc = 0;
+    if (online && !isHost) _scoreSounds(); // 게스트는 스냅샷으로 점수가 바뀐다
     _frame.value++;
+  }
+
+  /// 물리 이벤트 → 효과음
+  void _sounds() {
+    final a = GameAudio.instance;
+    for (final e in world.events) {
+      switch (e) {
+        case GameEvent.hit:
+          a.play(Sfx.hit);
+        case GameEvent.spike:
+          a.play(Sfx.spike);
+          HapticFeedback.lightImpact();
+        case GameEvent.net:
+          a.play(Sfx.net);
+        case GameEvent.wall:
+          a.play(Sfx.wall);
+        case GameEvent.ground:
+          a.play(Sfx.ground);
+        case GameEvent.jump:
+          a.play(Sfx.jump);
+        case GameEvent.dive:
+          a.play(Sfx.dive);
+        default:
+          break;
+      }
+    }
+    if (isHost) _scoreSounds();
+  }
+
+  /// 점수 / 서브 / 경기 종료 → 효과음 (호스트·게스트 모두 상태 변화로 판단)
+  void _scoreSounds() {
+    final a = GameAudio.instance;
+    final w = world;
+    if (w.solo) {
+      if (w.practiceTries != _lastTries) {
+        _lastTries = w.practiceTries;
+        a.play(w.lastPracticeSuccess ? Sfx.pointWin : Sfx.pointLose);
+      }
+    } else if (w.scores[0] != _lastScores[0] || w.scores[1] != _lastScores[1]) {
+      final mineUp = w.scores[mySide] > _lastScores[mySide];
+      _lastScores = List.of(w.scores);
+      if (w.scores[0] + w.scores[1] > 0) {
+        a.play(mineUp ? Sfx.pointWin : Sfx.pointLose);
+      }
+    }
+    if (w.phase != _lastPhase) {
+      if (w.phase == Phase.gameOver) {
+        a.play(w.winner == mySide ? Sfx.gameWin : Sfx.gameLose);
+      } else if (w.phase == Phase.serve && _lastPhase == Phase.point && !w.solo) {
+        a.play(Sfx.whistle, volume: 0.6);
+      }
+      _lastPhase = w.phase;
+    }
   }
 
   void _onMsg(Uint8List m) {
@@ -193,8 +266,11 @@ class _GameScreenState extends State<GameScreen>
     }
     setState(() {
       world.restart();
+      _lastScores = List.of(world.scores);
+      _lastTries = 0;
       paused = false;
     });
+    GameAudio.instance.play(Sfx.whistle);
   }
 
   void _exit(GameExit e, {bool notify = true}) {
@@ -222,6 +298,10 @@ class _GameScreenState extends State<GameScreen>
           SimpleDialogOption(
               onPressed: () => Navigator.pop(c, 'resume'),
               child: const Text('계속하기')),
+          if (widget.solo)
+            SimpleDialogOption(
+                onPressed: () => Navigator.pop(c, 'reset'),
+                child: const Text('기록 초기화')),
           SimpleDialogOption(
               onPressed: () => Navigator.pop(c, 'select'),
               child: const Text('캐릭터 다시 고르기')),
@@ -232,7 +312,9 @@ class _GameScreenState extends State<GameScreen>
       ),
     );
     if (!mounted) return;
-    if (r == 'select') {
+    if (r == 'reset') {
+      _rematch();
+    } else if (r == 'select') {
       _exit(GameExit.select);
     } else if (r == 'leave') {
       _exit(GameExit.leave);
@@ -353,7 +435,13 @@ class _Hud extends StatelessWidget {
         builder: (context, _, _) {
           final w = state.world;
           String? banner;
-          if (w.phase == Phase.serve && w.frame < 150 && w.scores[0] + w.scores[1] == 0) {
+          if (w.solo) {
+            if (w.phase == Phase.serve && w.practiceTries == 0) {
+              banner = '공을 네트 너머로!';
+            } else if (w.phase == Phase.point) {
+              banner = w.lastPracticeSuccess ? '성공!' : '실패...';
+            }
+          } else if (w.phase == Phase.serve && w.frame < 150 && w.scores[0] + w.scores[1] == 0) {
             banner = '${w.winScore}점 선취!';
           } else if (w.phase == Phase.point) {
             banner = w.lastScorer == state.mySide ? '득점!' : '실점...';
@@ -362,14 +450,17 @@ class _Hud extends StatelessWidget {
             child: Column(
               children: [
                 const SizedBox(height: 6),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    _score(w.scores[0], state.widget.looks[0], state.mySide == 0),
-                    const SizedBox(width: 24),
-                    _score(w.scores[1], state.widget.looks[1], state.mySide == 1),
-                  ],
-                ),
+                if (w.solo)
+                  _practiceBoard(w)
+                else
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      _score(w.scores[0], state.widget.looks[0], state.mySide == 0),
+                      const SizedBox(width: 24),
+                      _score(w.scores[1], state.widget.looks[1], state.mySide == 1),
+                    ],
+                  ),
                 const Spacer(),
                 if (banner != null)
                   Text(banner,
@@ -384,6 +475,34 @@ class _Hud extends StatelessWidget {
           );
         },
       ),
+    );
+  }
+
+  Widget _practiceBoard(World w) {
+    final rate = w.practiceTries == 0
+        ? '-'
+        : '${(w.practiceSuccess * 100 / w.practiceTries).round()}%';
+    Widget cell(String label, String value) => Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Text(label, style: const TextStyle(fontSize: 11, color: kInk)),
+            Text(value,
+                style: const TextStyle(
+                    fontSize: 22, fontWeight: FontWeight.w900, color: kInk)),
+          ]),
+        );
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.8),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        cell('성공', '${w.practiceSuccess}/${w.practiceTries}'),
+        cell('성공률', rate),
+        cell('연속', '${w.streak}'),
+        cell('최고 연속', '${w.bestStreak}'),
+      ]),
     );
   }
 

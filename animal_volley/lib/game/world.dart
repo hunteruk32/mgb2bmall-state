@@ -59,6 +59,9 @@ class Player {
   /// 화면 연출용(물리에 영향 없음): 공을 친 직후 반짝임 등
   int hitFlash = 0;
 
+  /// 환경설정의 '캐릭터 이동 속도' 배율
+  double speedScale = 1.0;
+
   Player(this.side) {
     reset();
   }
@@ -96,7 +99,7 @@ class Player {
 
     switch (state) {
       case PlayerState.ground:
-        vx = dir * Tuning.moveSpeed;
+        vx = dir * Tuning.moveSpeed * speedScale;
         if (pressed & Input.jump != 0) {
           vy = -Tuning.jumpSpeed;
           state = PlayerState.air;
@@ -105,12 +108,12 @@ class Player {
           state = PlayerState.dive;
           diveTimer = Tuning.diveFrames;
           diveDir = dir;
-          vx = dir * Tuning.diveSpeed;
+          vx = dir * Tuning.diveSpeed * speedScale;
           vy = -4;
         }
         break;
       case PlayerState.air:
-        vx = dir * Tuning.moveSpeed;
+        vx = dir * Tuning.moveSpeed * speedScale;
         if (pressed & Input.hit != 0 && spikeTimer == 0) {
           spikeTimer = Tuning.spikeFrames;
         }
@@ -159,7 +162,7 @@ class Ball {
 }
 
 /// 사운드/진동 같은 연출용 이벤트
-enum GameEvent { hit, spike, net, wall, ground, point, win }
+enum GameEvent { hit, spike, net, wall, ground, point, win, jump, dive, serve }
 
 class World {
   final players = [Player(0), Player(1)];
@@ -175,10 +178,38 @@ class World {
   /// false면 득점 판정을 하지 않는다(블루투스 게스트 쪽 예측 시뮬레이션용).
   bool authoritative;
 
+  /// 환경설정의 '공 속도' 배율. 궤적은 그대로 두고 시간만 빠르게/느리게 흐른다.
+  final double ballSpeed;
+
+  /// 서브 연습 모드: 오른쪽 선수 없이 왼쪽 선수 혼자 계속 서브한다.
+  final bool solo;
+
+  /// 서브 연습 기록
+  int practiceTries = 0, practiceSuccess = 0, streak = 0, bestStreak = 0;
+  bool lastPracticeSuccess = false;
+
   final List<GameEvent> events = [];
 
-  World({this.winScore = Tuning.winScore, this.authoritative = true}) {
+  World({
+    this.winScore = Tuning.winScore,
+    this.authoritative = true,
+    this.ballSpeed = 1.0,
+    double moveSpeed = 1.0,
+    this.solo = false,
+  }) {
+    for (final p in players) {
+      p.speedScale = moveSpeed;
+    }
     startRound(0);
+  }
+
+  /// 서브 연습에서 오른쪽 선수는 경기장 밖에 세워 둔다
+  void _parkSolo() {
+    if (!solo) return;
+    final p = players[1];
+    p.x = Court.width + 400;
+    p.y = p.groundCenterY;
+    p.vx = p.vy = 0;
   }
 
   int? get winner {
@@ -194,24 +225,39 @@ class World {
     ball.placeForServe(serveSide);
     phase = Phase.serve;
     phaseTimer = 30;
+    _parkSolo();
+    events.add(GameEvent.serve);
   }
 
   void restart() {
     scores[0] = scores[1] = 0;
+    practiceTries = practiceSuccess = streak = bestStreak = 0;
     lastScorer = -1;
     startRound(0);
   }
 
   /// 한 프레임 진행. inputs[0] = 왼쪽 플레이어, inputs[1] = 오른쪽 플레이어
+  void _stepPlayers(List<int> inputs) {
+    for (var i = 0; i < 2; i++) {
+      if (solo && i == 1) continue;
+      final p = players[i];
+      final before = p.state;
+      p.step(inputs[i]);
+      if (before == PlayerState.ground && p.state == PlayerState.air) {
+        events.add(GameEvent.jump);
+      } else if (before != PlayerState.dive && p.state == PlayerState.dive) {
+        events.add(GameEvent.dive);
+      }
+    }
+  }
+
   void step(List<int> inputs) {
     frame++;
     events.clear();
 
     switch (phase) {
       case Phase.serve:
-        for (var i = 0; i < 2; i++) {
-          players[i].step(inputs[i]);
-        }
+        _stepPlayers(inputs);
         // 서브 공은 잠깐 떠 있다가 떨어진다
         if (phaseTimer > 0) {
           phaseTimer--;
@@ -221,23 +267,21 @@ class World {
         _collidePlayers();
         break;
       case Phase.playing:
-        for (var i = 0; i < 2; i++) {
-          players[i].step(inputs[i]);
-        }
+        _stepPlayers(inputs);
         _stepBall();
         _collidePlayers();
         break;
       case Phase.point:
-        for (var i = 0; i < 2; i++) {
-          players[i].step(0);
-        }
+        _stepPlayers(const [0, 0]);
         if (ball.y < Court.groundY - Tuning.ballRadius) {
           _stepBall(scoring: false);
         }
         if (authoritative) {
           phaseTimer--;
           if (phaseTimer <= 0) {
-            if (scores[lastScorer] >= winScore) {
+            if (solo) {
+              startRound(0);
+            } else if (scores[lastScorer] >= winScore) {
               phase = Phase.gameOver;
               events.add(GameEvent.win);
             } else {
@@ -247,19 +291,18 @@ class World {
         }
         break;
       case Phase.gameOver:
-        for (var i = 0; i < 2; i++) {
-          players[i].step(0);
-        }
+        _stepPlayers(const [0, 0]);
         break;
     }
   }
 
   void _stepBall({bool scoring = true}) {
     final b = ball;
-    b.vy += Tuning.ballGravity;
-    b.x += b.vx;
-    b.y += b.vy;
-    b.angle += b.vx * 0.04;
+    final s = ballSpeed;
+    b.vy += Tuning.ballGravity * s;
+    b.x += b.vx * s;
+    b.y += b.vy * s;
+    b.angle += b.vx * 0.04 * s;
     if (b.powerTrail > 0) b.powerTrail--;
 
     const r = Tuning.ballRadius;
@@ -287,7 +330,23 @@ class World {
       b.y = Court.groundY - r;
       if (scoring && phase == Phase.playing) {
         events.add(GameEvent.ground);
-        if (authoritative) {
+        if (authoritative && solo) {
+          // 서브 연습: 네트 너머에 떨어지면 성공
+          final ok = b.x > Court.netX;
+          practiceTries++;
+          lastPracticeSuccess = ok;
+          if (ok) {
+            practiceSuccess++;
+            streak++;
+            if (streak > bestStreak) bestStreak = streak;
+          } else {
+            streak = 0;
+          }
+          lastScorer = ok ? 0 : 1;
+          phase = Phase.point;
+          phaseTimer = 55;
+          events.add(GameEvent.point);
+        } else if (authoritative) {
           final scorer = b.x < Court.netX ? 1 : 0;
           scores[scorer]++;
           lastScorer = scorer;
@@ -345,6 +404,7 @@ class World {
     if (phase != Phase.playing && phase != Phase.serve) return;
     final b = ball;
     for (final p in players) {
+      if (solo && p.side == 1) continue;
       if (p.hitCooldown > 0) continue;
       // 다이빙 중에는 몸이 납작해지므로 판정 중심을 조금 내린다
       final py = p.state == PlayerState.dive ? p.y + 10 : p.y;

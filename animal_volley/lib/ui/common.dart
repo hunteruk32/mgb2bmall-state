@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import '../audio.dart';
 import '../game/characters.dart';
 
 const kInk = Color(0xFF2B2440);
@@ -27,7 +28,12 @@ class BigButton extends StatelessWidget {
         elevation: enabled ? 3 : 0,
         child: InkWell(
           borderRadius: BorderRadius.circular(18),
-          onTap: onTap,
+          onTap: onTap == null
+              ? null
+              : () {
+                  GameAudio.instance.play(Sfx.click);
+                  onTap!();
+                },
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
             child: Row(

@@ -3,6 +3,7 @@ import '../game/characters.dart';
 import 'common.dart';
 import 'lobby_screen.dart';
 import 'select_screen.dart';
+import 'settings_screen.dart';
 
 class TitleScreen extends StatelessWidget {
   const TitleScreen({super.key});
@@ -61,12 +62,28 @@ class TitleScreen extends StatelessWidget {
                                 MaterialPageRoute(
                                     builder: (_) => const LobbyScreen()))),
                         BigButton('CPU와 연습',
-                            sub: '혼자 하기',
+                            sub: '컴퓨터와 경기',
                             icon: Icons.smart_toy_outlined,
                             onTap: () => Navigator.push(
                                 context,
                                 MaterialPageRoute(
                                     builder: (_) => const SelectScreen()))),
+                        BigButton('서브 연습',
+                            sub: '혼자 계속 서브',
+                            icon: Icons.sports_volleyball,
+                            color: const Color(0xFF4CAF7A),
+                            onTap: () => Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                    builder: (_) =>
+                                        const SelectScreen(serveOnly: true)))),
+                        BigButton('설정',
+                            icon: Icons.settings,
+                            color: const Color(0xFF8A7FB0),
+                            onTap: () => Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                    builder: (_) => const SettingsScreen()))),
                         BigButton('조작법',
                             icon: Icons.help_outline,
                             color: const Color(0xFF8A7FB0),
@@ -93,4 +110,8 @@ const _howTo = '''◀ ▶  좌우 이동
  · 뒤로 누른 채 → 높이 띄우는 페인트
  · 땅에서 방향과 함께 누르면 다이빙
 
-먼저 15점을 내면 승리!''';
+먼저 15점을 내면 승리!
+
+[서브 연습]
+상대 없이 공이 계속 내 머리 위로 올라와요.
+공을 네트 너머로 넘기면 성공!''';

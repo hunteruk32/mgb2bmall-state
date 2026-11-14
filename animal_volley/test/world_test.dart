@@ -105,4 +105,77 @@ void main() {
       print('$level: ${w.scores} in ${(frames / 60).toStringAsFixed(0)}s');
     }
   });
+
+  test('서브 연습: 상대 없이 공이 계속 다시 올라오고 기록이 쌓인다', () {
+    final w = World(solo: true);
+    final cpu = CpuBrain(0, level: CpuLevel.hard, seed: 3);
+    for (var i = 0; i < 60 * 120; i++) {
+      w.step([cpu.think(w), Input.left | Input.jump | Input.hit]);
+      expect(w.phase, isNot(Phase.gameOver));
+      // 오른쪽 선수는 경기장 밖에 있고 움직이지 않는다
+      expect(w.players[1].x, greaterThan(Court.width));
+    }
+    expect(w.practiceTries, greaterThan(10));
+    expect(w.practiceSuccess, greaterThan(0));
+    expect(w.practiceSuccess, lessThanOrEqualTo(w.practiceTries));
+    expect(w.bestStreak, greaterThanOrEqualTo(w.streak));
+    expect(w.scores, [0, 0]);
+  });
+
+  test('서브 연습: 내 코트에 떨어지면 실패, 넘기면 성공', () {
+    final w = World(solo: true);
+    w.phase = Phase.playing;
+    w.players[0].x = 40;
+    w.ball..x = 200..y = 300..vx = 0..vy = 0;
+    for (var i = 0; i < 100 && w.phase == Phase.playing; i++) {
+      w.step([0, 0]);
+    }
+    expect(w.practiceTries, 1);
+    expect(w.lastPracticeSuccess, isFalse);
+    // 다음 서브가 시작되기를 기다린 뒤, 상대 코트로 공을 보낸다
+    for (var i = 0; i < 100 && w.phase != Phase.serve; i++) {
+      w.step([0, 0]);
+    }
+    w.phase = Phase.playing;
+    w.players[0].x = 40;
+    w.ball..x = 600..y = 300..vx = 0..vy = 0;
+    for (var i = 0; i < 100 && w.phase == Phase.playing; i++) {
+      w.step([0, 0]);
+    }
+    expect(w.practiceTries, 2);
+    expect(w.practiceSuccess, 1);
+    expect(w.lastPracticeSuccess, isTrue);
+  });
+
+  test('공 속도 설정: 궤적은 같고 빨라질수록 더 일찍 떨어진다', () {
+    int framesToLand(double speed) {
+      final w = World(ballSpeed: speed);
+      w.phase = Phase.playing;
+      w.players[0].x = 40;
+      w.players[1].x = 760;
+      w.ball..x = 300..y = 80..vx = 3..vy = -4;
+      var n = 0;
+      while (w.phase == Phase.playing && n < 1000) {
+        w.step([0, 0]);
+        n++;
+      }
+      return n;
+    }
+    final slow = framesToLand(0.6), normal = framesToLand(1.0), fast = framesToLand(1.6);
+    expect(slow, greaterThan(normal));
+    expect(normal, greaterThan(fast));
+  });
+
+  test('이동 속도 설정: 빠를수록 같은 시간에 더 멀리 간다', () {
+    double distance(double move) {
+      final w = World(moveSpeed: move);
+      final x0 = w.players[0].x;
+      for (var i = 0; i < 20; i++) {
+        w.step([Input.right, 0]);
+      }
+      return w.players[0].x - x0;
+    }
+    expect(distance(1.5), greaterThan(distance(1.0) * 1.4));
+    expect(distance(0.6), lessThan(distance(1.0) * 0.7));
+  });
 }

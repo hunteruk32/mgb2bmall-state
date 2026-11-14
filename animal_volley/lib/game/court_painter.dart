@@ -123,6 +123,7 @@ class CourtPainter extends CustomPainter {
   void _shadows(Canvas c) {
     final sh = Paint()..color = const Color(0x33000000);
     for (final p in world.players) {
+      if (world.solo && p.side == 1) continue;
       final h = (p.groundCenterY - p.y).clamp(0, 200) / 200;
       final w = 60 * (1 - h * 0.5);
       c.drawOval(
@@ -159,6 +160,7 @@ class CourtPainter extends CustomPainter {
 
   void _players(Canvas c) {
     for (var i = 0; i < 2; i++) {
+      if (world.solo && i == 1) continue;
       final p = world.players[i];
       c.save();
       c.translate(p.x, p.y);
