@@ -18,7 +18,7 @@ class CpuBrain {
   final math.Random _rng;
   int _thinkDelay = 0;
   int _held = 0;
-  int _spikeChoice = 0; // -1 뒤, 0 기본, 1 앞
+  SpikeDir _spikeChoice = SpikeDir.normal;
   double _offset = 0;
 
   CpuBrain(this.side, {this.level = CpuLevel.normal, int? seed})
@@ -105,7 +105,13 @@ class CpuBrain {
           (b.x - Court.netX).abs() < 260 &&
           _rng.nextDouble() < _attackChance) {
         input |= Input.jump;
-        _spikeChoice = _rng.nextInt(3) - 1;
+        // 공격적인 방향을 더 자주 고른다
+        const choices = [
+          SpikeDir.normal, SpikeDir.normal, SpikeDir.forward, SpikeDir.forward,
+          SpikeDir.forwardDown, SpikeDir.forwardDown, SpikeDir.down,
+          SpikeDir.forwardUp, SpikeDir.up, SpikeDir.back,
+        ];
+        _spikeChoice = choices[_rng.nextInt(choices.length)];
       }
       // 너무 멀면 다이빙
       final dist = landX - me.x;
@@ -120,14 +126,16 @@ class CpuBrain {
       final d = math.sqrt(math.pow(b.x - me.x, 2) + math.pow(b.y - me.y, 2));
       if (d < 85) {
         input |= Input.hit;
-        input &= ~(Input.left | Input.right);
-        if (_spikeChoice == 1) input |= f > 0 ? Input.right : Input.left;
-        if (_spikeChoice == -1) input |= f > 0 ? Input.left : Input.right;
+        input &= ~(Input.left | Input.right | Input.down);
+        input |= _spikeChoice.inputFor(f);
       }
     }
 
     // 버튼은 매번 새로 눌러야 하므로 직전에 누르고 있던 점프/히트는 한 번 뗀다
-    if (_held & Input.jump != 0) input &= ~Input.jump;
+    // (공중에서는 위 방향 = 스파이크 방향이라 그대로 둔다)
+    if (me.state == PlayerState.ground && _held & Input.jump != 0) {
+      input &= ~Input.jump;
+    }
     if (_held & Input.hit != 0) input &= ~Input.hit;
 
     _held = input;

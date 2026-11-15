@@ -111,6 +111,7 @@ class _GameScreenState extends State<GameScreen>
     if (keys.contains(LogicalKeyboardKey.arrowLeft)) bits |= Input.left;
     if (keys.contains(LogicalKeyboardKey.arrowRight)) bits |= Input.right;
     if (keys.contains(LogicalKeyboardKey.arrowUp)) bits |= Input.jump;
+    if (keys.contains(LogicalKeyboardKey.arrowDown)) bits |= Input.down;
     if (keys.contains(LogicalKeyboardKey.space) ||
         keys.contains(LogicalKeyboardKey.keyZ)) {
       bits |= Input.hit;
@@ -461,6 +462,18 @@ class _Hud extends StatelessWidget {
                       _score(w.scores[1], state.widget.looks[1], state.mySide == 1),
                     ],
                   ),
+                // 방금 친 스파이크 종류를 잠깐 보여준다
+                SizedBox(
+                  height: 30,
+                  child: (w.frame - w.lastSpikeFrame < 45 && w.lastSpikeSide >= 0)
+                      ? Text('${w.lastSpikeSide == state.mySide ? '' : '상대 '}${w.lastSpike.label}!',
+                          style: const TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.w900,
+                              color: Color(0xFFFFE27A),
+                              shadows: [Shadow(color: kInk, offset: Offset(2, 2))]))
+                      : null,
+                ),
                 const Spacer(),
                 if (banner != null)
                   Text(banner,

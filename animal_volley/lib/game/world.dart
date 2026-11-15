@@ -27,7 +27,10 @@ class Tuning {
 
   static const int diveFrames = 32;
   static const double diveSpeed = 10;
-  static const int spikeFrames = 14; // 스파이크 판정이 유지되는 프레임
+  static const int spikeFrames = 18; // 스파이크 판정이 유지되는 프레임
+
+  /// 스파이크 중에는 몸 둘레보다 이만큼 더 멀리 있는 공도 칠 수 있다
+  static const double spikeReach = 22;
   static const int hitCooldown = 8;
 
   static const int pointPauseFrames = 80;
@@ -40,6 +43,57 @@ class Input {
   static const int right = 2;
   static const int jump = 4;
   static const int hit = 8;
+
+  /// 아래 방향 (공중 스파이크 방향용). 위 방향은 jump 비트를 같이 쓴다.
+  static const int down = 16;
+  static const int up = jump;
+}
+
+/// 공중 스파이크 방향 (조이스틱 방향 + 스파이크)
+enum SpikeDir { normal, forward, forwardDown, down, forwardUp, up, back }
+
+extension SpikeDirInfo on SpikeDir {
+  String get label => switch (this) {
+        SpikeDir.normal => '내리꽂기',
+        SpikeDir.forward => '직선 강타',
+        SpikeDir.forwardDown => '대각선 강스파이크',
+        SpikeDir.down => '수직 스파이크',
+        SpikeDir.forwardUp => '깊숙이 넘기기',
+        SpikeDir.up => '높이 띄우기',
+        SpikeDir.back => '페인트',
+      };
+
+  /// 이 방향으로 치려면 눌러야 하는 입력 (forward: +1 오른쪽 / -1 왼쪽)
+  int inputFor(int forward) {
+    final fwd = forward > 0 ? Input.right : Input.left;
+    final bwd = forward > 0 ? Input.left : Input.right;
+    return switch (this) {
+      SpikeDir.normal => 0,
+      SpikeDir.forward => fwd,
+      SpikeDir.forwardDown => fwd | Input.down,
+      SpikeDir.down => Input.down,
+      SpikeDir.forwardUp => fwd | Input.up,
+      SpikeDir.up => Input.up,
+      SpikeDir.back => bwd,
+    };
+  }
+
+  /// 입력 → 스파이크 방향
+  static SpikeDir fromInput(int input, int forward) {
+    final fwdBit = forward > 0 ? Input.right : Input.left;
+    final bwdBit = forward > 0 ? Input.left : Input.right;
+    final fwd = input & fwdBit != 0 && input & bwdBit == 0;
+    final bwd = input & bwdBit != 0 && input & fwdBit == 0;
+    final up = input & Input.up != 0;
+    final down = input & Input.down != 0 && !up;
+    if (bwd) return SpikeDir.back;
+    if (fwd && down) return SpikeDir.forwardDown;
+    if (fwd && up) return SpikeDir.forwardUp;
+    if (fwd) return SpikeDir.forward;
+    if (down) return SpikeDir.down;
+    if (up) return SpikeDir.up;
+    return SpikeDir.normal;
+  }
 }
 
 enum PlayerState { ground, air, dive }
@@ -412,18 +466,27 @@ class World {
       final dy = b.y - py;
       final d = math.sqrt(dx * dx + dy * dy);
       final minD = Tuning.playerRadius + Tuning.ballRadius;
-      if (d >= minD) continue;
+      // 스파이크 중이면 판정 범위가 넓어진다 (단, 네트 너머 공은 못 친다)
+      final ownSide = p.side == 0
+          ? b.x < Court.netX + Tuning.ballRadius
+          : b.x > Court.netX - Tuning.ballRadius;
+      final spiking =
+          p.spikeTimer > 0 && p.state == PlayerState.air && ownSide;
+      final reach = spiking ? minD + Tuning.spikeReach : minD;
+      if (d >= reach) continue;
 
       if (phase == Phase.serve) phase = Phase.playing;
 
       final nx = d > 0 ? dx / d : 0.0;
       final ny = d > 0 ? dy / d : -1.0;
-      b.x = p.x + nx * minD;
-      b.y = py + ny * minD;
+      if (d < minD) {
+        b.x = p.x + nx * minD;
+        b.y = py + ny * minD;
+      }
       p.hitCooldown = Tuning.hitCooldown;
       p.hitFlash = 10;
 
-      if (p.spikeTimer > 0 && p.state == PlayerState.air) {
+      if (spiking) {
         _spike(p);
       } else {
         // 일반 리시브: 몸에서 튕겨 나간다
@@ -440,30 +503,31 @@ class World {
     }
   }
 
+  /// 마지막 스파이크 방향 (화면 표시용)
+  SpikeDir lastSpike = SpikeDir.normal;
+  int lastSpikeSide = -1;
+  int lastSpikeFrame = -999;
+
   void _spike(Player p) {
     final b = ball;
-    final input = p.prevInput;
     final f = p.forward;
-    final holdForward =
-        (f > 0 && input & Input.right != 0) || (f < 0 && input & Input.left != 0);
-    final holdBack =
-        (f > 0 && input & Input.left != 0) || (f < 0 && input & Input.right != 0);
-
-    if (holdForward) {
-      // 직선 강타
-      b.vx = 19.0 * f;
-      b.vy = 2.5;
-    } else if (holdBack) {
-      // 페인트(높이 띄워 넘기기)
-      b.vx = 7.5 * f;
-      b.vy = -11;
-    } else {
-      // 기본 내리꽂기
-      b.vx = 14.5 * f;
-      b.vy = 10;
-    }
-    b.powerTrail = holdBack ? 0 : 40;
+    final dir = SpikeDirInfo.fromInput(p.prevInput, f);
+    final (vx, vy, power) = switch (dir) {
+      SpikeDir.normal => (14.5, 10.0, true), // 기본 대각선 내리꽂기
+      SpikeDir.forward => (19.0, 2.5, true), // 빠른 직선
+      SpikeDir.forwardDown => (16.5, 13.0, true), // 강한 대각선
+      SpikeDir.down => (11.5, 16.0, true), // 거의 수직
+      SpikeDir.forwardUp => (5.5, -9.3, false), // 깊숙이 높게
+      SpikeDir.up => (3.2, -9.5, false), // 높이 띄우기
+      SpikeDir.back => (2.6, -3.5, false), // 네트 바로 너머 페인트
+    };
+    b.vx = vx * f;
+    b.vy = vy;
+    b.powerTrail = power ? 40 : 0;
     p.spikeTimer = 0;
+    lastSpike = dir;
+    lastSpikeSide = p.side;
+    lastSpikeFrame = frame;
     events.add(GameEvent.spike);
   }
 

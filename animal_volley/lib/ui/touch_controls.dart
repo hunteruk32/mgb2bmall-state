@@ -68,6 +68,8 @@ class _TouchControlsState extends State<TouchControls> {
         _jumpHeld = false;
       }
       if (_jumpHeld) bits |= Input.jump;
+      // 아래 방향 (공중 스파이크 방향용)
+      if (d.dy > _jumpThr) bits |= Input.down;
     } else {
       _jumpHeld = false;
     }
@@ -165,7 +167,8 @@ class _ControlsPainter extends CustomPainter {
     _arrow(canvas, origin + Offset(-r * 0.72, 0), math.pi, bits & Input.left != 0, r);
     _arrow(canvas, origin + Offset(r * 0.72, 0), 0, bits & Input.right != 0, r);
     _arrow(canvas, origin + Offset(0, -r * 0.72), -math.pi / 2, bits & Input.jump != 0, r);
-    _text(canvas, '점프', origin + Offset(0, -r - 10), r * 0.24,
+    _arrow(canvas, origin + Offset(0, r * 0.72), math.pi / 2, bits & Input.down != 0, r);
+    _text(canvas, '점프 / 위', origin + Offset(0, -r - 10), r * 0.22,
         bits & Input.jump != 0);
     // 손잡이
     canvas.drawCircle(knob, r * 0.42,
